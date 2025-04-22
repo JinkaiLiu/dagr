@@ -48,8 +48,8 @@ def train(loader: DataLoader,
           run_name=""):
 
     model.train()
-
-    for i, data in enumerate(tqdm.tqdm(loader, desc=f"Training {run_name}")):
+    #tdqm是一个进度条库，tqdm.tqdm(loader)是一个迭代器，用于显示训练进度
+    for i, data in enumerate(tqdm.tqdm(loader, desc=f"Training {run_name}")): #enumerate是一个内置函数，返回一个可遍历的元组，包含索引和数据
         data = data.cuda(non_blocking=True)
         data = format_data(data)
 
@@ -66,10 +66,10 @@ def train(loader: DataLoader,
 
         fix_gradients(model)
 
-        optimizer.step()
-        scheduler.step()
+        optimizer.step()  #动态更新参数
+        scheduler.step() #动态更新学习率
 
-        ema.update(model)
+        ema.update(model) #更新EMA模型
 
         training_logs = {f"training/loss/{k}": v for k, v in loss_dict.items()}
         wandb.log({"training/loss": loss.item(), "training/lr": scheduler.get_last_lr()[-1], **training_logs})
@@ -177,7 +177,7 @@ if __name__ == '__main__':
         if epoch % 3 > 0:
             continue
 
-        with torch.no_grad():
+        with torch.no_grad(): #用于临时禁用梯度计算。
             mapcalc = run_test(test_loader, ema.ema, dataset=args.dataset)
             metrics = mapcalc.compute()
             checkpointer.process(metrics, epoch)

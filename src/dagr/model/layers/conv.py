@@ -12,7 +12,7 @@ class ConvBlock(torch.nn.Module):
         super(ConvBlock, self).__init__()
         self.dim = args.edge_attr_dim
         self.activation = getattr(torch.nn.functional, args.activation, torch.nn.functional.elu)
-        self.conv = MySplineConv(in_channels=in_channels,
+        self.conv = MySplineConv(in_channels=in_channels, 
                                  out_channels=out_channels,
                                  args=args,
                                  bias=False,
@@ -56,7 +56,7 @@ class ConvBlockWithSkip(torch.nn.Module):
         return data
 
 
-class Layer(torch.nn.Module):
+class Layer(torch.nn.Module): #定义卷积层，extendedfigure1中的c图（橙色标注的），即图残差连接的过程
     def __init__(self, in_channels: int, out_channels: int, args) -> None:
         super(Layer, self).__init__()
         self.in_channel = in_channels
@@ -66,7 +66,7 @@ class Layer(torch.nn.Module):
         self.conv_block2 = ConvBlockWithSkip(out_channels, out_channels, in_channels, args=args)
 
     def forward(self, data: Data) -> torch.Tensor:
-        data_skip = shallow_copy(data)
-        data = self.conv_block1(data)
-        output = self.conv_block2(data, data_skip)
+        data_skip = shallow_copy(data) # 复制数据以保留原始数据，跳跃连接是用于残差连接的
+        data = self.conv_block1(data) # 进行卷积操作
+        output = self.conv_block2(data, data_skip) # 进行卷积操作并添加跳跃连接
         return output

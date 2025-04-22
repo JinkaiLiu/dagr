@@ -19,7 +19,7 @@ def consecutive_cluster(src):
 class Pooling(torch.nn.Module):
     def __init__(self, size: List[float], width, height, batch_size, transform: Callable[[Data, ], Data], aggr: str = 'max', keep_temporal_ordering=False, dim=2, self_loop=False, in_channels=-1):
         super(Pooling, self).__init__()
-        assert aggr in ['mean', 'max']
+        assert aggr in ['mean', 'max'] #聚合方式只能是mean或者max，assert是一个断言语句，用于检查条件是否为真，如果不为真，则抛出异常并终止程序的执行。
         self.aggr = aggr
         self.register_buffer("voxel_size", torch.cat([size, torch.Tensor([1])]), persistent=False)
 
@@ -40,7 +40,7 @@ class Pooling(torch.nn.Module):
         if in_channels > 0:
             self.bn = BatchNormData(in_channels)
 
-    @property
+    @property #@是一个装饰器，用于将函数转换为属性访问的方式
     def num_grid_cells(self):
         return (1/self.voxel_size+1e-3).int().prod()
     

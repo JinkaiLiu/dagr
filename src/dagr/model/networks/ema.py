@@ -2,8 +2,8 @@ import torch
 import math
 from copy import deepcopy
 
-
-class ModelEMA:
+#EMA 通过对模型权重进行指数加权平均，生成一个更平滑的权重版本，通常在验证或推理阶段表现更好。
+class ModelEMA: 
     """
     Model Exponential Moving Average from https://github.com/rwightman/pytorch-image-models
     Keep a moving average of everything in the model state_dict (parameters and buffers).

@@ -75,7 +75,7 @@ class DAGR(YOLOX):
         if not hasattr(self.head, "output_sizes"):
             self.head.output_sizes = self.backbone.get_output_sizes()
 
-        if self.training:
+        if self.training: #如果是训练，那么就需要将数据转换为训练格式，x包含图data和ground truth bbox
             targets = convert_to_training_format(x.bbox, x.bbox_batch, x.num_graphs)
 
             if self.backbone.use_image:

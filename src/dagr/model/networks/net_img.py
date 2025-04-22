@@ -38,7 +38,7 @@ class ConvBlockDense(torch.nn.Module):
             x = self.act(x)
         return x
 
-
+#用于在模型的特定层上注册钩子，提取中间特征或输出，并支持对这些特征进行降维处理。它在模型调试、特征可视化和复杂模型设计中非常有用。
 class HookModule(torch.nn.Module):
     """
     Define the module, then you can determine which features are extracted, and which outputs are extracted.

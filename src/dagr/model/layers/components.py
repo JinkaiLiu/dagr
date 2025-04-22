@@ -21,7 +21,7 @@ class Linear(torch.nn.Module):
         data.x = self.mlp(data.x)
         return data
 
-
+##用于计算事件数据的空间位置和时间信息。该对象使用归一化参数和最大值进行初始化。
 class Cartesian(torch.nn.Module):
     def __init__(self, *args, **kwargs):
         super().__init__()
