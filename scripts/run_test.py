@@ -39,9 +39,13 @@ if __name__ == '__main__':
 
     print("init datasets")
     dataset_path = args.dataset_directory.parent / args.dataset
-
-    test_dataset = DSEC(args.dataset_directory, "test", Augmentations.transform_testing, debug=False, min_bbox_diag=15, min_bbox_height=10)
-
+    try:
+        test_dataset = DSEC(args.dataset_directory, "test", Augmentations.transform_testing, debug=False, min_bbox_diag=15, min_bbox_height=10)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print("[ERROR] Dataset loading failed")
+        exit(1)
     num_iters_per_epoch = 1
 
     sampler = np.random.permutation(np.arange(len(test_dataset)))

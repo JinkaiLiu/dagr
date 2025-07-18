@@ -26,7 +26,7 @@ class Checkpointer:
         checkpoint = self.search_for_checkpoint(folder, best=resume_from_best)
         if checkpoint is not None:
             print(f"Found existing checkpoint at {checkpoint}, resuming...")
-            self.restore_checkpoint(folder, best=resume_from_best)
+            return self.restore_checkpoint(folder, best=resume_from_best)
 
     def mAP_from_checkpoint_name(self, checkpoint_name: Path):
         return float(str(checkpoint_name).split("_")[-1].split(".pth")[0])
@@ -89,6 +89,7 @@ class Checkpointer:
 
     def process(self, data: Dict[str, float], epoch: int):
         mAP = data['mAP']
+        print(f"Epoch {epoch}: mAP = {mAP:.4f}, mAP_max = {self.mAP_max:.4f}")
         data = {f"validation/metric/{k}": v for k, v in data.items()}
         data['epoch'] = epoch
         wandb.log(data)
@@ -96,14 +97,14 @@ class Checkpointer:
         if mAP > self.mAP_max:
             self.checkpoint(epoch, name=f"best_model_mAP_{mAP}")
             self.mAP_max = mAP
-
+            print(f"new best model! mAP: {mAP:.4f}")
 
 def set_up_logging_directory(dataset, task, output_directory, exp_name="temp"):
     project = f"low_latency-{dataset}-{task}"
 
     output_directory = output_directory / dataset / task
     output_directory.mkdir(parents=True, exist_ok=True)
-    wandb.init(project=project, id=exp_name, entity="danielgehrig18", save_code=True, dir=str(output_directory))
+    wandb.init(project=project, id=exp_name, entity="jinkai-liu-technical-university-of-munich", save_code=True, dir=str(output_directory))
 
     name = wandb.run.id
     output_directory = output_directory / name

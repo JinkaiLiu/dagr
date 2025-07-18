@@ -30,6 +30,14 @@ class MySplineConv(SplineConv):
         edge_attr = dxy.view((2,-1)).t()
 
         bil_w, indices = spline_basis(edge_attr.to(self.weight.data.device), self.kernel_size, self.is_open_spline, self.degree)
+
+        #device = self.weight.device
+       # cpu_bil_w = bil_w.cpu()
+      #  cpu_weight = self.weight.cpu()
+     #   cpu_indices = indices.cpu()
+    #    lut_weights = (cpu_bil_w[...,None,None] * cpu_weight[cpu_indices]).sum(1)
+   #     lut_weights = lut_weights.to(device)
+
         lut_weights = (bil_w[...,None,None] * self.weight[indices]).sum(1)
         _, cin, cout = lut_weights.shape
         self.lut_weights = lut_weights.view((2 * rx + 1, 2 * ry + 1, cin, cout))

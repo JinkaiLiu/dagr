@@ -17,7 +17,7 @@ def draw_bbox_on_img(img, x, y, w, h, labels, scores=None, conf=0.5, nms=0.45, l
         h = h[mask]
         labels = labels[mask]
         scores = scores[mask]
-
+        scores = scores.copy()
     for i in range(len(x)):
         if scores is not None and scores[i] < conf:
             continue
@@ -34,7 +34,6 @@ def draw_bbox_on_img(img, x, y, w, h, labels, scores=None, conf=0.5, nms=0.45, l
 
         if scores is not None:
             text += f":{scores[i] * 100: .1f}"
-
         txt_color = (0, 0, 0) if np.mean(_COLORS[cls_id]) > 0.5 else (255, 255, 255)
         font = cv2.FONT_HERSHEY_SIMPLEX
 
@@ -54,19 +53,26 @@ def draw_bbox_on_img(img, x, y, w, h, labels, scores=None, conf=0.5, nms=0.45, l
     return img
 
 def filter_boxes(x, y, w, h, labels, scores, conf, nms):
+    scores = np.ascontiguousarray(scores)
+    labels = np.ascontiguousarray(labels)
+
     mask = scores > conf
 
     x1, y1 = x + w, y + h
     box_coords = np.stack([x, y, x1, y1], axis=-1)
 
+    boxes_tensor = torch.from_numpy(box_coords)
+    scores_tensor = torch.from_numpy(scores.copy())
+    labels_tensor = torch.from_numpy(labels.copy())
+
     nms_out_index = torchvision.ops.batched_nms(
-        torch.from_numpy(box_coords),
-        torch.from_numpy(np.ascontiguousarray(scores)),
-        torch.from_numpy(labels),
+        boxes_tensor,
+        scores_tensor,
+        labels_tensor,
         nms
     )
 
-    nms_mask = np.ones_like(mask) == 0
+    nms_mask = np.zeros_like(mask, dtype=bool)
     nms_mask[nms_out_index] = True
 
     return mask & nms_mask

@@ -120,7 +120,8 @@ if __name__ == '__main__':
     augmentations = Augmentations(args)
 
     print("init datasets")
-    dataset_path = args.dataset_directory / args.dataset
+    #dataset_path = args.dataset_directory / args.dataset
+    dataset_path = args.dataset_directory
 
     train_dataset = DSEC(root=dataset_path, split="train", transform=augmentations.transform_training, debug=False,
                          min_bbox_diag=15, min_bbox_height=10)
@@ -130,8 +131,8 @@ if __name__ == '__main__':
     train_loader = DataLoader(train_dataset, follow_batch=['bbox', 'bbox0'], batch_size=args.batch_size, shuffle=True, num_workers=4, drop_last=True)
     num_iters_per_epoch = len(train_loader)
 
-    sampler = np.random.permutation(np.arange(len(test_dataset)))
-    test_loader = DataLoader(test_dataset, sampler=sampler, follow_batch=['bbox', 'bbox0'], batch_size=args.batch_size, shuffle=False, num_workers=4, drop_last=True)
+    #sampler = np.random.permutation(np.arange(len(test_dataset)))
+    test_loader = DataLoader(test_dataset, follow_batch=['bbox', 'bbox0'], batch_size=args.batch_size, shuffle=False, num_workers=4, drop_last=True)
 
     print("init net")
     # load a dummy sample to get height, width
@@ -158,9 +159,11 @@ if __name__ == '__main__':
                                 scheduler=lr_scheduler, ema=ema,
                                 args=args)
 
-    start_epoch = checkpointer.restore_if_existing(output_directory, resume_from_best=False)
-
-    start_epoch = 0
+    start_epoch = checkpointer.restore_if_existing(output_directory, resume_from_best=True)
+    #start_epoch = checkpointer.restore_if_existing(output_directory, resume_from_best=False)
+    print(f"[DEBUG] After restore_if_existing: start_epoch = {start_epoch}")
+    #start_epoch = 0
+    #print(f"[DEBUG] After reset: start_epoch = {start_epoch}")
     if "resume_checkpoint" in args:
         start_epoch = checkpointer.restore_checkpoint(args.resume_checkpoint, best=False)
         print(f"Resume from checkpoint at epoch {start_epoch}")
@@ -170,6 +173,7 @@ if __name__ == '__main__':
         mapcalc.compute()
 
     print("starting to train")
+    print(f"[FINAL] Starting training from epoch: {start_epoch}")
     for epoch in range(start_epoch, args.tot_num_epochs):
         train(train_loader, model, ema, lr_scheduler, optimizer, args, run_name=wandb.run.name)
         checkpointer.checkpoint(epoch, name=f"last_model")
@@ -178,7 +182,9 @@ if __name__ == '__main__':
             continue
 
         with torch.no_grad():
+            print("test_loader length =", len(test_loader))
             mapcalc = run_test(test_loader, ema.ema, dataset=args.dataset)
             metrics = mapcalc.compute()
+            print(f"mAP: {metrics.get('mAP', 'N/A')}")
             checkpointer.process(metrics, epoch)
 
