@@ -108,10 +108,10 @@ class Net(torch.nn.Module):
     def forward(self, data: Data, reset=True):
         if self.use_image:
             image_feat, image_outputs = self.net(data.image)
-            print(f"[DEBUG] data.image shape: {data.image.shape if hasattr(data.image, 'shape') else 'No shape'}")
-            print(f"[DEBUG] image_feat type: {type(image_feat)}")
-            print(f"[DEBUG] image_feat length: {len(image_feat) if hasattr(image_feat, '__len__') else 'No length'}")
-            print(f"[DEBUG] image_outputs: {image_outputs}")
+            #print(f"[DEBUG] data.image shape: {data.image.shape if hasattr(data.image, 'shape') else 'No shape'}")
+            #print(f"[DEBUG] image_feat type: {type(image_feat)}")
+            #print(f"[DEBUG] image_feat length: {len(image_feat) if hasattr(image_feat, '__len__') else 'No length'}")
+            #print(f"[DEBUG] image_outputs: {image_outputs}")
         if hasattr(data, 'reset'):
             reset = data.reset
 

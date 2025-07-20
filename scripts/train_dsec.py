@@ -2,7 +2,16 @@
 import os
 os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
 
+os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+
+
 import torch
+
+torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.deterministic = True
+torch.use_deterministic_algorithms(False)
+
 import tqdm
 import wandb
 from pathlib import Path
@@ -36,7 +45,7 @@ def gradients_broken(model):
 def fix_gradients(model):
     for name, param in model.named_parameters():
         if param.grad is not None:
-            param.grad = torch.nan_to_num(param.grad, nan=0.0)
+            param.grad.data = torch.nan_to_num(param.grad.data, nan=0.0)
 
 
 def train(loader: DataLoader,
@@ -65,6 +74,19 @@ def train(loader: DataLoader,
         torch.nn.utils.clip_grad_value_(model.parameters(), args.clip)
 
         fix_gradients(model)
+
+        # 确保所有梯度和参数在同一设备上
+        device = next(model.parameters()).device
+        for group in optimizer.param_groups:
+            for p in group['params']:
+                if p.grad is not None:
+                    p.grad = p.grad.to(device)
+
+        # 确保优化器状态在正确设备上
+        for state in optimizer.state.values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.to(device)
 
         optimizer.step()
         scheduler.step()
@@ -148,6 +170,12 @@ if __name__ == '__main__':
     lr = args.l_r * np.sqrt(args.batch_size) / np.sqrt(nominal_batch_size)
     optimizer = torch.optim.AdamW(list(model.parameters()), lr=lr, weight_decay=args.weight_decay)
 
+    if torch.cuda.is_available():
+        for state in optimizer.state.values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.cuda()
+
     lr_func = LRSchedule(warmup_epochs=.3,
                          num_iters_per_epoch=num_iters_per_epoch,
                          tot_num_epochs=args.tot_num_epochs)
@@ -162,6 +190,9 @@ if __name__ == '__main__':
     start_epoch = checkpointer.restore_if_existing(output_directory, resume_from_best=True)
     #start_epoch = checkpointer.restore_if_existing(output_directory, resume_from_best=False)
     print(f"[DEBUG] After restore_if_existing: start_epoch = {start_epoch}")
+    if start_epoch is None:
+        start_epoch = 0
+
     #start_epoch = 0
     #print(f"[DEBUG] After reset: start_epoch = {start_epoch}")
     if "resume_checkpoint" in args:
@@ -187,4 +218,3 @@ if __name__ == '__main__':
             metrics = mapcalc.compute()
             print(f"mAP: {metrics.get('mAP', 'N/A')}")
             checkpointer.process(metrics, epoch)
-

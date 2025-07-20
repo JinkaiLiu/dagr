@@ -78,7 +78,19 @@ class MySplineConv(SplineConv):
             out = torch.zeros((x.size(0), self.out_channels), dtype=x.dtype, device=x.device)
 
         if x is not None and self.root_weight:
-            out += self.lin(x)
+            try:
+                out += self.lin(x)
+            except RuntimeError as e:
+                if "CUBLAS" in str(e):
+                    # 使用 CPU 计算避免 CUBLAS 问题
+                    x_cpu = x.cpu()
+                    lin_cpu = self.lin.cpu()
+                    result_cpu = lin_cpu(x_cpu)
+                    out += result_cpu.to(x.device)
+                    # 将 lin 移回 GPU
+                    self.lin = self.lin.to(x.device)
+                else:
+                    raise e
 
         if self.bias is not None:
             out += self.bias
