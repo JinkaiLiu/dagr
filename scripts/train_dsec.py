@@ -193,6 +193,15 @@ if __name__ == '__main__':
     if start_epoch is None:
         start_epoch = 0
 
+    # 如果从断点恢复，同步学习率调度器
+    if start_epoch > 0:
+        print(f"[INFO] Resuming from epoch {start_epoch}, synchronizing lr_scheduler")
+        # 快进学习率调度器到正确的步数
+        total_steps = start_epoch * num_iters_per_epoch
+        for _ in range(total_steps):
+            lr_scheduler.step()
+        print(f"[INFO] LR scheduler advanced {total_steps} steps")
+
     #start_epoch = 0
     #print(f"[DEBUG] After reset: start_epoch = {start_epoch}")
     if "resume_checkpoint" in args:

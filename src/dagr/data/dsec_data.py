@@ -314,7 +314,7 @@ class DSEC(Dataset):
         return image
 
     def __getitem__(self, idx):
-        print(f"[DEBUG] __getitem__ called with index {idx}")
+        #print(f"[DEBUG] __getitem__ called with index {idx}")
         dataset, image_index_pairs, track_masks, idx = self.rel_index(idx)
         image_index_0, image_index_1 = image_index_pairs[idx]
         image_ts_0, image_ts_1 = dataset.images.timestamps[[image_index_0, image_index_1]]

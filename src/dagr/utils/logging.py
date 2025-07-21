@@ -57,17 +57,49 @@ class Checkpointer:
         assert path is not None, "No checkpoint found in {}".format(checkpoint_directory)
         print("Restoring checkpoint from {}".format(path))
         checkpoint = torch.load(path)
-
         checkpoint['model'] = self.fix_checkpoint(checkpoint['model'])
         checkpoint['ema'] = self.fix_checkpoint(checkpoint['ema'])
-
+    
         if self.ema is not None:
             self.ema.ema.load_state_dict(checkpoint.get('ema', checkpoint['model']))
             self.ema.updates = checkpoint.get('ema_updates', 0)
+    
+        # 恢复模型权重
         self.restore_if_not_none(self.model, checkpoint['model'])
-        self.restore_if_not_none(self.optimizer, checkpoint['optimizer'])
-        self.restore_if_not_none(self.scheduler, checkpoint['scheduler'])
+    
+        # 尝试恢复优化器状态，如果失败则跳过
+        try:
+            self.restore_if_not_none(self.optimizer, checkpoint['optimizer'])
+            print("[INFO] Optimizer state restored successfully")
+        except (ValueError, RuntimeError) as e:
+            print(f"[WARNING] Could not restore optimizer state: {e}")
+            print("[INFO] Optimizer will restart from initial state")
+    
+        # 尝试恢复学习率调度器
+        try:
+            self.restore_if_not_none(self.scheduler, checkpoint['scheduler'])
+            print("[INFO] Scheduler state restored successfully")
+        except (ValueError, RuntimeError) as e:
+            print(f"[WARNING] Could not restore scheduler state: {e}")
+            print("[INFO] Scheduler will restart from initial state")
+    
         return checkpoint['epoch']
+    #def restore_checkpoint(self, checkpoint_directory, best=False):
+    #    path = self.search_for_checkpoint(checkpoint_directory, best)
+    #    assert path is not None, "No checkpoint found in {}".format(checkpoint_directory)
+    #    print("Restoring checkpoint from {}".format(path))
+    #    checkpoint = torch.load(path)
+
+    #    checkpoint['model'] = self.fix_checkpoint(checkpoint['model'])
+    #    checkpoint['ema'] = self.fix_checkpoint(checkpoint['ema'])
+
+    #    if self.ema is not None:
+    #        self.ema.ema.load_state_dict(checkpoint.get('ema', checkpoint['model']))
+    #        self.ema.updates = checkpoint.get('ema_updates', 0)
+    #    self.restore_if_not_none(self.model, checkpoint['model'])
+    #    self.restore_if_not_none(self.optimizer, checkpoint['optimizer'])
+    #    self.restore_if_not_none(self.scheduler, checkpoint['scheduler'])
+    #    return checkpoint['epoch']
 
     def fix_checkpoint(self, state_dict):
         return state_dict
