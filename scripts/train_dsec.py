@@ -28,7 +28,10 @@ from dagr.data.augment import Augmentations
 from dagr.utils.buffers import format_data
 from dagr.data.dsec_data import DSEC
 
-from dagr.model.networks.dagr import DAGR
+from dagr.model.networks.dagr_fcos import DAGR_FCOS as DAGR
+
+#DAGR with YOLOX Head
+#from dagr.model.networks.dagr import DAGR
 from dagr.model.networks.ema import ModelEMA
 
 
@@ -57,6 +60,8 @@ def train(loader: DataLoader,
           run_name=""):
 
     model.train()
+    total_loss = 0.0
+    num_batches = 0
 
     for i, data in enumerate(tqdm.tqdm(loader, desc=f"Training {run_name}")):
         data = data.cuda(non_blocking=True)
@@ -68,6 +73,9 @@ def train(loader: DataLoader,
 
         loss_dict = {k: v for k, v in model_outputs.items() if "loss" in k}
         loss = loss_dict.pop("total_loss")
+
+        total_loss += loss.item()
+        num_batches += 1
 
         loss.backward()
 
@@ -95,6 +103,10 @@ def train(loader: DataLoader,
 
         training_logs = {f"training/loss/{k}": v for k, v in loss_dict.items()}
         wandb.log({"training/loss": loss.item(), "training/lr": scheduler.get_last_lr()[-1], **training_logs})
+
+    avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+    return avg_loss
+
 
 def run_test(loader: DataLoader,
          model: torch.nn.Module,
@@ -215,7 +227,9 @@ if __name__ == '__main__':
     print("starting to train")
     print(f"[FINAL] Starting training from epoch: {start_epoch}")
     for epoch in range(start_epoch, args.tot_num_epochs):
-        train(train_loader, model, ema, lr_scheduler, optimizer, args, run_name=wandb.run.name)
+        #train(train_loader, model, ema, lr_scheduler, optimizer, args, run_name=wandb.run.name)
+        avg_loss = train(train_loader, model, ema, lr_scheduler, optimizer, args, run_name=wandb.run.name)
+        print(f"Epoch {epoch}: Average Loss = {avg_loss:.4f}")
         checkpointer.checkpoint(epoch, name=f"last_model")
 
         if epoch % 3 > 0:
