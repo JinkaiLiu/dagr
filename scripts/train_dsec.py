@@ -28,10 +28,11 @@ from dagr.data.augment import Augmentations
 from dagr.utils.buffers import format_data
 from dagr.data.dsec_data import DSEC
 
-from dagr.model.networks.dagr_fcos import DAGR_FCOS as DAGR
+#DAGR with FCOS Head
+#from dagr.model.networks.dagr_fcos import DAGR_FCOS as DAGR
 
 #DAGR with YOLOX Head
-#from dagr.model.networks.dagr import DAGR
+from dagr.model.networks.dagr import DAGR
 from dagr.model.networks.ema import ModelEMA
 
 
