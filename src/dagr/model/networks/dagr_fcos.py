@@ -1,8 +1,8 @@
-Wimport torch
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.ops as ops
-
+from dagr.model.networks.net import sampling_skip
 from dagr.model.networks.fcos_head import FCOSHead
 from dagr.model.networks.net import Net
 from dagr.model.utils import (
@@ -60,16 +60,18 @@ class DAGR(nn.Module):
             init_subnetwork(self, state_dict['ema'], "backbone.net.", freeze=True)
 
     def forward(self, x, reset=True, return_targets=True, filtering=True):
-        features = self.backbone(x)
-
+        if self.use_image:
+            event_feat, image_feat = self.backbone(x)
+        else:
+            event_feat = self.backbone(x)
+            image_feat = None
         # CNN-only pretraining 模式
         if self.training and self.pretrain_cnn:
             targets = convert_to_training_format(x.bbox, x.bbox_batch, x.num_graphs)
-            return self.cnn_head(features["image"][:2], targets=targets, training=True)
+            return self.cnn_head(image_feat, targets=targets, training=True)
 
         # 不使用 event 分支，只用 image 推理
         if not self.training and self.no_events:
-            image_feat = features[2:4]
             outputs = self.cnn_head(image_feat, training=False)
             outputs = torch.cat([
                 outputs[..., :4],
@@ -79,12 +81,15 @@ class DAGR(nn.Module):
             return [outputs]
 
         # 正常训练或推理，使用融合特征送入主干 FCOSHead
-        event_feat = features[:2]
-        image_feat = features[2:4]
         fused_feat = event_feat
-        if self.use_image:
-            image_feat = features[2:4]
-            fused_feat = [a + b.detach() for a, b in zip(fused_feat, image_feat)]
+        if self.use_image and image_feat is not None:
+            for i in range(len(event_feat)):
+                event_feat[i].width = torch.tensor([image_feat[i].shape[-1]])
+                event_feat[i].height = torch.tensor([image_feat[i].shape[-2]])
+                print(f"[DEBUG] event_feat[{i}].x.shape = {event_feat[i].x.shape}")
+                print(f"[DEBUG] image_feat[{i}].shape = {image_feat[i].shape}")
+                event_feat[i].x = sampling_skip(event_feat[i], image_feat[i].detach())
+        fused_feat = event_feat
 
         if self.training:
             targets = convert_to_training_format(x.bbox, x.bbox_batch, x.num_graphs)
@@ -99,6 +104,8 @@ class DAGR(nn.Module):
                 }
 
             return loss_fused
+        for i, f in enumerate(fused_feat):
+            print(f"[DEBUG] Feature {i}: x.shape = {f.x.shape}, height = {getattr(f, 'height', 'N/A')}, width = {getattr(f, 'width', 'N/A')}")
 
         # 推理阶段
         x.reset = reset
