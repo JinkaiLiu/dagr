@@ -22,6 +22,23 @@ def focal_loss(pred, target, alpha=0.25, gamma=2.0):
         loss *= alpha_t
     return loss.sum()
 
+def unpack_fused_features(fused_feat):
+    features_tensor = []
+    features_hw = []
+    for f in fused_feat:
+        if hasattr(f, "x") and isinstance(f.x, torch.Tensor):
+            features_tensor.append(f.x)
+            # 记录 height 和 width, int 而不是 tensor
+            height = f.height.item() if hasattr(f, "height") else None
+            width = f.width.item() if hasattr(f, "width") else None
+            features_hw.append((height, width))
+        else:
+            # fallback 情况，例如纯 tensor，不是 PyG Data
+            features_tensor.append(f)
+            features_hw.append((None, None))
+    return features_tensor, features_hw
+
+
 class DAGR(nn.Module):
     def __init__(self, args, height, width):
         super().__init__()
@@ -109,7 +126,8 @@ class DAGR(nn.Module):
 
         # 推理阶段
         x.reset = reset
-        outputs = self.head(fused_feat, training=False)
+        fused_feat_x, fused_hw = unpack_fused_features(fused_feat)
+        outputs = self.head(fused_feat_x, hw=fused_hw, training=False)
         outputs = torch.cat([
             outputs[..., :4],
             outputs[..., 4:5],

@@ -56,7 +56,7 @@ class FCOSHead(nn.Module):
         else:
             return loss
 
-    def forward(self, feats, targets=None, training=False):
+    def forward(self, feats, targets=None, training=False, hw=None):
         cls_scores = []
         reg_preds = []
         centernesses = []
