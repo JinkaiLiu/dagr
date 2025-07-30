@@ -49,6 +49,7 @@ def train(loader: DataLoader,
     model.train()
     total_loss = 0.0
     num_batches = 0
+    running_losses = {}
 
     for i, data in enumerate(tqdm.tqdm(loader, desc=f"Training {run_name}")):
         data = data.cuda(non_blocking=True)
@@ -89,6 +90,32 @@ def train(loader: DataLoader,
             
         total_loss += loss_value
         num_batches += 1
+
+        for k, v in loss_dict.items():
+            if hasattr(v, 'item'):
+                v_value = v.item()
+            elif isinstance(v, dict) and 'total_loss' in v:
+                v_value = v['total_loss'].item() if hasattr(v['total_loss'], 'item') else float(v['total_loss'])
+            else:
+                v_value = float(v)
+            
+            if k not in running_losses:
+                running_losses[k] = []
+            running_losses[k].append(v_value)
+
+        if (i + 1) % 10 == 0:
+            avg_losses = {k: sum(v[-10:]) / len(v[-10:]) for k, v in running_losses.items()}
+            current_lr = scheduler.get_last_lr()[-1]
+            
+            print(f"Iteration {i+1}/{len(loader)}:")
+            print(f"  Total Loss: {loss_value:.4f} (avg: {sum(running_losses.get('total', [loss_value])[-10:]) / min(10, len(running_losses.get('total', [loss_value]))):.4f})")
+            print(f"  Learning Rate: {current_lr:.6f}")
+            
+            for k, v in avg_losses.items():
+                clean_key = k.replace("_", " ").title()
+                print(f"  {clean_key}: {v:.4f}")
+            print("-" * 50)
+
 
         loss.backward()
         torch.nn.utils.clip_grad_value_(model.parameters(), args.clip)
@@ -196,7 +223,7 @@ if __name__ == '__main__':
     lr_func = LRSchedule(warmup_epochs=0.3, num_iters_per_epoch=num_iters_per_epoch, tot_num_epochs=args.tot_num_epochs)
     lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_func)
 
-    checkpointer = Checkpointer(output_directory, model, optimizer, lr_scheduler, ema, args)
+    checkpointer = Checkpointer(output_directory=output_directory, args=args, optimizer=optimizer, scheduler=lr_scheduler, ema=ema, model=model)
     start_epoch = checkpointer.restore_if_existing(output_directory, resume_from_best=True) or 0
 
     if start_epoch > 0:
