@@ -1,4 +1,3 @@
-# avoid matlab error on server
 import os
 os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
 os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
@@ -59,21 +58,42 @@ def train(loader: DataLoader,
 
         model_outputs = model(data)
 
-        # 修改处 1：双分支 loss 加权融合
         loss_dict = {k: v for k, v in model_outputs.items() if "loss" in k}
         lambda_cnn = getattr(args, "lambda_cnn_loss", 1.0)
         loss_fusion = loss_dict.get("fusion_total_loss", 0.0)
         loss_cnn = loss_dict.get("cnn_total_loss", 0.0)
+        
+        # 确保损失是张量，处理嵌套字典的情况
+        if isinstance(loss_fusion, dict):
+            loss_fusion = loss_fusion.get("total_loss", 0.0)
+        if isinstance(loss_cnn, dict):
+            loss_cnn = loss_cnn.get("total_loss", 0.0)
+        
+        # 确保损失是张量类型，如果是标量则转换为张量
+        device = next(model.parameters()).device
+        if not torch.is_tensor(loss_fusion):
+            loss_fusion = torch.tensor(float(loss_fusion), device=device, requires_grad=True)
+        if not torch.is_tensor(loss_cnn):
+            loss_cnn = torch.tensor(float(loss_cnn), device=device, requires_grad=True)
+            
         loss = loss_fusion + lambda_cnn * loss_cnn
+        
+        # 确保总损失也是张量
+        if not torch.is_tensor(loss):
+            loss = torch.tensor(float(loss), device=device, requires_grad=True)
 
-        total_loss += loss.item()
+        if hasattr(loss, 'item'):
+            loss_value = loss.item()
+        else:
+            loss_value = float(loss)
+            
+        total_loss += loss_value
         num_batches += 1
 
         loss.backward()
         torch.nn.utils.clip_grad_value_(model.parameters(), args.clip)
         fix_gradients(model)
 
-        # 确保所有梯度和参数在同一设备上
         device = next(model.parameters()).device
         for group in optimizer.param_groups:
             for p in group['params']:
@@ -88,13 +108,19 @@ def train(loader: DataLoader,
         scheduler.step()
         ema.update(model)
 
-        # 修改处 2：兼容 wandb 记录的 key 命名
         training_logs = {}
         for k, v in loss_dict.items():
             clean_key = k.replace("_", "/")
-            training_logs[f"training/loss/{clean_key}"] = v
+            if hasattr(v, 'item'):
+                v_value = v.item()
+            elif isinstance(v, dict) and 'total_loss' in v:
+                v_value = v['total_loss'].item() if hasattr(v['total_loss'], 'item') else float(v['total_loss'])
+            else:
+                v_value = float(v)
+            training_logs[f"training/loss/{clean_key}"] = v_value
+            
         wandb.log({
-            "training/loss": loss.item(),
+            "training/loss": loss_value,
             "training/lr": scheduler.get_last_lr()[-1],
             **training_logs
         })
@@ -132,7 +158,7 @@ if __name__ == '__main__':
     random.seed(seed)
 
     args = FLAGS()
-    setattr(args, "lambda_cnn_loss", 1.0)  # 可调分支 loss 权重
+    setattr(args, "lambda_cnn_loss", 1.0)
 
     output_directory = set_up_logging_directory(args.dataset, args.task, args.output_directory, exp_name=args.exp_name)
     log_hparams(args)
