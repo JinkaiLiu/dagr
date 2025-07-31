@@ -353,13 +353,26 @@ class FCOSHead(nn.Module):
             device = next(self.parameters()).device
             return torch.zeros(1, 1, 5 + self.num_classes, device=device)
         
-        min_batch_size = min(cls.shape[0] for cls in cls_scores)
-        print(f"[DEBUG] Decode - Min batch size: {min_batch_size}")
+        # 创建深拷贝避免修改原始数据
+        cls_scores_copy = [cls.clone() for cls in cls_scores]
+        reg_preds_copy = [reg.clone() for reg in reg_preds]  
+        centernesses_copy = [ctr.clone() for ctr in centernesses]
         
-        cls_scores = [cls[:min_batch_size] for cls in cls_scores]
-        reg_preds = [reg[:min_batch_size] for reg in reg_preds]
-        centernesses = [ctr[:min_batch_size] for ctr in centernesses]
-            
+        for i, scores in enumerate(cls_scores_copy):
+            print(f"[DEBUG] cls_scores_copy[{i}] type: {type(scores)}, shape: {scores.shape if hasattr(scores, 'shape') else 'no shape'}")
+        for i, regs in enumerate(reg_preds_copy):
+            print(f"[DEBUG] reg_preds_copy[{i}] type: {type(regs)}, shape: {regs.shape if hasattr(regs, 'shape') else 'no shape'}")
+        for i, ctrs in enumerate(centernesses_copy):
+            print(f"[DEBUG] centernesses_copy[{i}] type: {type(ctrs)}, shape: {ctrs.shape if hasattr(ctrs, 'shape') else 'no shape'}")
+        
+        try:
+            min_batch_size = min(cls.shape[0] for cls in cls_scores_copy if hasattr(cls, 'shape') and cls.shape[0] > 0)
+            print(f"[DEBUG] Decode - Min batch size: {min_batch_size}")
+        except Exception as e:
+            print(f"[ERROR] Failed to compute min batch size: {e}")
+            device = next(self.parameters()).device
+            return torch.zeros(1, 1, 5 + self.num_classes, device=device)
+        
         B = min_batch_size
         outputs = []
 
@@ -368,14 +381,40 @@ class FCOSHead(nn.Module):
             boxes_all, scores_all, labels_all = [], [], []
             detection_count = 0
 
-            for level_idx, (cls, reg, ctr) in enumerate(zip(cls_scores, reg_preds, centernesses)):
-                if level_idx >= len(self.strides):
-                    print(f"[DEBUG] Skipping level {level_idx}, no stride available")
-                    break
-                
-                if batch_idx >= cls.shape[0]:
-                    print(f"[WARNING] Batch index {batch_idx} exceeds cls tensor size {cls.shape[0]} at level {level_idx}")
-                    break
+            for level_idx in range(len(cls_scores_copy)):
+                try:
+                    if level_idx >= len(self.strides):
+                        print(f"[DEBUG] Skipping level {level_idx}, no stride available")
+                        break
+                    
+                    cls = cls_scores_copy[level_idx]
+                    reg = reg_preds_copy[level_idx] 
+                    ctr = centernesses_copy[level_idx]
+                    
+                    print(f"[DEBUG] Level {level_idx}: Processing tensors with shapes cls={cls.shape}, reg={reg.shape}, ctr={ctr.shape}")
+                    
+                    if not isinstance(cls, torch.Tensor):
+                        print(f"[ERROR] cls at level {level_idx} is not tensor: {type(cls)}")
+                        continue
+                    if not isinstance(reg, torch.Tensor):
+                        print(f"[ERROR] reg at level {level_idx} is not tensor: {type(reg)}")
+                        continue
+                    if not isinstance(ctr, torch.Tensor):
+                        print(f"[ERROR] ctr at level {level_idx} is not tensor: {type(ctr)}")
+                        continue
+                    
+                    if len(cls.shape) < 1 or len(reg.shape) < 1 or len(ctr.shape) < 1:
+                        print(f"[ERROR] Invalid tensor dimensions at level {level_idx}")
+                        continue
+                        
+                    if batch_idx >= cls.shape[0] or batch_idx >= reg.shape[0] or batch_idx >= ctr.shape[0]:
+                        print(f"[WARNING] Batch index {batch_idx} exceeds tensor size at level {level_idx}: cls={cls.shape[0]}, reg={reg.shape[0]}, ctr={ctr.shape[0]}")
+                        break
+                except Exception as e:
+                    print(f"[ERROR] Exception during tensor validation at level {level_idx}: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    continue
                     
                 try:
                     print(f"[DEBUG] Level {level_idx}, Batch {batch_idx}: cls.shape={cls.shape}, reg.shape={reg.shape}, ctr.shape={ctr.shape}")

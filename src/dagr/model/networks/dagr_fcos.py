@@ -11,18 +11,30 @@ from dagr.model.utils import (
     init_subnetwork
 )
 
-def postprocess_network_output(prediction, conf_thres, nms_thres):
+def analyze_and_fix_postprocess(prediction, conf_thres, nms_thres, debug_mode=True):
+    """
+    完整的检测结果分析和修复函数
+    解决 "No valid boxes after filtering" 问题
+    """
+    if debug_mode:
+        print(f"\n[BBOX_ANALYSIS] ========== Starting Detection Analysis ==========")
+        print(f"[BBOX_ANALYSIS] Input prediction shape: {prediction.shape}")
+        print(f"[BBOX_ANALYSIS] Confidence threshold: {conf_thres}")
+        print(f"[BBOX_ANALYSIS] NMS threshold: {nms_thres}")
+    
     if not isinstance(prediction, torch.Tensor):
-        print(f"[WARNING] postprocess_network_output received {type(prediction)}, returning empty")
+        if debug_mode:
+            print(f"[BBOX_ANALYSIS] ERROR: Expected tensor, got {type(prediction)}")
         return []
         
     if prediction.numel() == 0:
-        print(f"[WARNING] Empty prediction tensor")
+        if debug_mode:
+            print(f"[BBOX_ANALYSIS] ERROR: Empty prediction tensor")
         return []
     
-    print(f"[DEBUG] Postprocessing prediction shape: {prediction.shape}")
-    print(f"[DEBUG] Confidence threshold: {conf_thres}")
-        
+    if debug_mode:
+        print(f"[BBOX_ANALYSIS] Prediction stats: min={prediction.min().item():.4f}, max={prediction.max().item():.4f}, mean={prediction.mean().item():.4f}")
+    
     batch_size = prediction.shape[0]
     
     if prediction.dim() == 3:
@@ -34,29 +46,71 @@ def postprocess_network_output(prediction, conf_thres, nms_thres):
         num_classes = num_classes.item()
     num_classes = int(num_classes)
     
-    print(f"[DEBUG] Detected num_classes: {num_classes}")
+    if debug_mode:
+        print(f"[BBOX_ANALYSIS] Batch size: {batch_size}, Num classes: {num_classes}")
     
     output = []
     total_detections = 0
+    total_valid_boxes = 0
     
     for batch_idx in range(batch_size):
+        if debug_mode:
+            print(f"\n[BBOX_ANALYSIS] --- Processing Batch {batch_idx}/{batch_size} ---")
+        
         image_pred = prediction[batch_idx]
         
         if image_pred.dim() == 1:
             image_pred = image_pred.unsqueeze(0)
             
         if image_pred.shape[0] == 0:
+            if debug_mode:
+                print(f"[BBOX_ANALYSIS] Batch {batch_idx}: Empty predictions")
             output.append([])
             continue
         
-        print(f"[DEBUG] Batch {batch_idx}: Processing {image_pred.shape[0]} predictions")
-            
-        conf_scores = image_pred[:, 4]
-        print(f"[DEBUG] Batch {batch_idx}: Confidence range: {conf_scores.min().item():.4f} to {conf_scores.max().item():.4f}")
+        if debug_mode:
+            print(f"[BBOX_ANALYSIS] Batch {batch_idx}: {image_pred.shape[0]} raw predictions")
         
+        # 分析原始预测数据
+        if debug_mode and image_pred.shape[1] >= 5:
+            coords = image_pred[:, :4]
+            conf_scores = image_pred[:, 4]
+            
+            print(f"[BBOX_ANALYSIS] Raw coordinates analysis:")
+            print(f"  Coord 0 (X/CX): [{coords[:, 0].min().item():.2f}, {coords[:, 0].max().item():.2f}] mean={coords[:, 0].mean().item():.2f}")
+            print(f"  Coord 1 (Y/CY): [{coords[:, 1].min().item():.2f}, {coords[:, 1].max().item():.2f}] mean={coords[:, 1].mean().item():.2f}")
+            print(f"  Coord 2 (W/X2): [{coords[:, 2].min().item():.2f}, {coords[:, 2].max().item():.2f}] mean={coords[:, 2].mean().item():.2f}")
+            print(f"  Coord 3 (H/Y2): [{coords[:, 3].min().item():.2f}, {coords[:, 3].max().item():.2f}] mean={coords[:, 3].mean().item():.2f}")
+            print(f"[BBOX_ANALYSIS] Confidence: [{conf_scores.min().item():.4f}, {conf_scores.max().item():.4f}] mean={conf_scores.mean().item():.4f}")
+            
+            # 格式检测
+            potential_widths = coords[:, 2]
+            potential_heights = coords[:, 3]
+            positive_wh = (potential_widths > 0) & (potential_heights > 0)
+            reasonable_wh = (potential_widths < 1000) & (potential_heights < 1000)
+            
+            potential_x2_gt_x1 = coords[:, 2] > coords[:, 0]
+            potential_y2_gt_y1 = coords[:, 3] > coords[:, 1]
+            valid_xyxy = potential_x2_gt_x1 & potential_y2_gt_y1
+            
+            print(f"[BBOX_ANALYSIS] Format detection:")
+            print(f"  XYWH indicators - positive W/H: {positive_wh.sum().item()}/{len(coords)}")
+            print(f"  XYWH indicators - reasonable W/H (<1000): {reasonable_wh.sum().item()}/{len(coords)}")
+            print(f"  XYXY indicators - valid boxes (x2>x1, y2>y1): {valid_xyxy.sum().item()}/{len(coords)}")
+            
+            if positive_wh.sum() > valid_xyxy.sum():
+                detected_format = "XYWH"
+            else:
+                detected_format = "XYXY"
+            print(f"[BBOX_ANALYSIS] Most likely format: {detected_format}")
+        
+        # 置信度过滤
+        conf_scores = image_pred[:, 4]
         conf_mask = conf_scores >= conf_thres
         above_threshold = conf_mask.sum().item()
-        print(f"[DEBUG] Batch {batch_idx}: {above_threshold} detections above threshold {conf_thres}")
+        
+        if debug_mode:
+            print(f"[BBOX_ANALYSIS] Confidence filtering: {above_threshold}/{len(conf_scores)} above threshold {conf_thres}")
         
         if above_threshold == 0:
             k = min(5, len(conf_scores))
@@ -64,14 +118,18 @@ def postprocess_network_output(prediction, conf_thres, nms_thres):
                 _, top_indices = torch.topk(conf_scores, k)
                 conf_mask = torch.zeros_like(conf_scores, dtype=torch.bool)
                 conf_mask[top_indices] = True
-                print(f"[DEBUG] Batch {batch_idx}: Using top-{k} detections as fallback")
+                if debug_mode:
+                    print(f"[BBOX_ANALYSIS] Using top-{k} detections as fallback")
         
         image_pred = image_pred[conf_mask]
         
         if image_pred.shape[0] == 0:
+            if debug_mode:
+                print(f"[BBOX_ANALYSIS] Batch {batch_idx}: No detections after confidence filtering")
             output.append([])
             continue
         
+        # 类别处理
         if num_classes > 0:
             class_scores = image_pred[:, 5:5 + num_classes]
             class_conf, class_pred = torch.max(class_scores, 1, keepdim=True)
@@ -90,33 +148,204 @@ def postprocess_network_output(prediction, conf_thres, nms_thres):
                 torch.zeros(image_pred.shape[0], 1, device=image_pred.device)
             ), 1)
         
+        if debug_mode:
+            print(f"[BBOX_ANALYSIS] After class processing: {detections.shape[0]} detections")
+        
+        # 关键修复：智能格式检测和处理
         batch_detections = []
         if detections.shape[0] > 0:
-            boxes_xyxy = detections[:, :4]
-            valid_boxes = (boxes_xyxy[:, 2] > boxes_xyxy[:, 0]) & (boxes_xyxy[:, 3] > boxes_xyxy[:, 1])
+            coords = detections[:, :4]
             
-            if valid_boxes.sum() > 0:
-                detections = detections[valid_boxes]
+            # 重新进行格式检测
+            potential_widths = coords[:, 2]
+            potential_heights = coords[:, 3]
+            positive_wh = (potential_widths > 0) & (potential_heights > 0)
+            reasonable_wh = (potential_widths < 2000) & (potential_heights < 2000)
+            
+            potential_x2_gt_x1 = coords[:, 2] > coords[:, 0]
+            potential_y2_gt_y1 = coords[:, 3] > coords[:, 1]
+            valid_xyxy = potential_x2_gt_x1 & potential_y2_gt_y1
+            
+            # 智能格式判断
+            xywh_score = positive_wh.sum().item()
+            xyxy_score = valid_xyxy.sum().item()
+            
+            if debug_mode:
+                print(f"[BBOX_ANALYSIS] Format scores - XYWH: {xywh_score}, XYXY: {xyxy_score}")
+            
+            if xywh_score >= xyxy_score:
+                # 处理为 XYWH 格式
+                if debug_mode:
+                    print(f"[BBOX_ANALYSIS] Processing as XYWH format")
                 
-                boxes = detections[:, :4].cpu()
-                scores = detections[:, 4].cpu()
-                labels = detections[:, 6].cpu().long() if num_classes > 0 else torch.zeros(detections.shape[0]).long()
+                valid_mask = positive_wh & reasonable_wh
                 
-                det_dict = {
-                    'boxes': boxes,
-                    'scores': scores,  
-                    'labels': labels
-                }
-                batch_detections.append(det_dict)
-                total_detections += len(boxes)
+                if debug_mode:
+                    print(f"[BBOX_ANALYSIS] XYWH valid detections: {valid_mask.sum().item()}/{len(coords)}")
                 
-                print(f"[DEBUG] Batch {batch_idx}: Generated {len(boxes)} valid detections")
+                if valid_mask.sum() > 0:
+                    valid_detections = detections[valid_mask]
+                    
+                    # XYWH → XYXY 转换
+                    cx, cy, w, h = valid_detections[:, 0], valid_detections[:, 1], valid_detections[:, 2], valid_detections[:, 3]
+                    
+                    # 检测异常小的 bounding box 并修复
+                    if debug_mode:
+                        small_boxes = (w < 1.0) | (h < 1.0)
+                        if small_boxes.sum() > 0:
+                            print(f"[BBOX_ANALYSIS] WARNING: {small_boxes.sum().item()} boxes have very small dimensions")
+                            print(f"[BBOX_ANALYSIS] Width range: [{w.min().item():.6f}, {w.max().item():.6f}]")
+                            print(f"[BBOX_ANALYSIS] Height range: [{h.min().item():.6f}, {h.max().item():.6f}]")
+                            print(f"[BBOX_ANALYSIS] Applying minimum size constraint...")
+                    
+                    # 应用最小尺寸约束 - 确保 box 至少有合理的尺寸
+                    min_size = 5.0  # 最小边长 5 像素
+                    w = torch.clamp(w, min=min_size)
+                    h = torch.clamp(h, min=min_size)
+                    
+                    x1 = cx - w / 2
+                    y1 = cy - h / 2
+                    x2 = cx + w / 2
+                    y2 = cy + h / 2
+                    boxes_xyxy = torch.stack([x1, y1, x2, y2], dim=1)
+                    
+                    # 转换后的有效性检查
+                    converted_valid = (boxes_xyxy[:, 2] > boxes_xyxy[:, 0]) & (boxes_xyxy[:, 3] > boxes_xyxy[:, 1])
+                    
+                    # 额外检查：确保 box 有合理的面积
+                    box_areas = (boxes_xyxy[:, 2] - boxes_xyxy[:, 0]) * (boxes_xyxy[:, 3] - boxes_xyxy[:, 1])
+                    reasonable_area = box_areas >= (min_size * min_size)  # 至少 25 平方像素
+                    converted_valid = converted_valid & reasonable_area
+                    
+                    if debug_mode:
+                        print(f"[BBOX_ANALYSIS] After XYWH→XYXY conversion: {converted_valid.sum().item()} valid boxes")
+                        print(f"[BBOX_ANALYSIS] After size correction and area filtering: {converted_valid.sum().item()} valid boxes")
+                        if converted_valid.sum() > 0:
+                            valid_boxes_xyxy = boxes_xyxy[converted_valid]
+                            valid_areas = box_areas[converted_valid]
+                            print(f"[BBOX_ANALYSIS] Converted box ranges:")
+                            print(f"  X1: [{valid_boxes_xyxy[:, 0].min().item():.2f}, {valid_boxes_xyxy[:, 0].max().item():.2f}]")
+                            print(f"  Y1: [{valid_boxes_xyxy[:, 1].min().item():.2f}, {valid_boxes_xyxy[:, 1].max().item():.2f}]")
+                            print(f"  X2: [{valid_boxes_xyxy[:, 2].min().item():.2f}, {valid_boxes_xyxy[:, 2].max().item():.2f}]")
+                            print(f"  Y2: [{valid_boxes_xyxy[:, 3].min().item():.2f}, {valid_boxes_xyxy[:, 3].max().item():.2f}]")
+                            print(f"  Box areas: [{valid_areas.min().item():.2f}, {valid_areas.max().item():.2f}]")
+                    
+                    if converted_valid.sum() > 0:
+                        final_boxes = boxes_xyxy[converted_valid]
+                        final_scores = valid_detections[converted_valid, 4]
+                        final_labels = valid_detections[converted_valid, 6].long() if num_classes > 0 else torch.zeros(converted_valid.sum(), dtype=torch.long)
+                        
+                        # 按类别进行 NMS
+                        final_keep_indices = []
+                        for class_id in torch.unique(final_labels):
+                            class_mask = final_labels == class_id
+                            if class_mask.sum() == 0:
+                                continue
+                                
+                            class_boxes = final_boxes[class_mask]
+                            class_scores = final_scores[class_mask]
+                            
+                            if len(class_boxes) > 0:
+                                keep = ops.nms(class_boxes, class_scores, iou_threshold=nms_thres)
+                                class_indices = torch.where(class_mask)[0]
+                                final_keep_indices.extend(class_indices[keep].tolist())
+                        
+                        if len(final_keep_indices) > 0:
+                            keep_tensor = torch.tensor(final_keep_indices, device=final_boxes.device)
+                            
+                            det_dict = {
+                                'boxes': final_boxes[keep_tensor].cpu(),
+                                'scores': final_scores[keep_tensor].cpu(),
+                                'labels': final_labels[keep_tensor].cpu()
+                            }
+                            batch_detections.append(det_dict)
+                            total_valid_boxes += len(keep_tensor)
+                            
+                            if debug_mode:
+                                print(f"[BBOX_ANALYSIS] Final XYWH detections after NMS: {len(keep_tensor)}")
+                        else:
+                            if debug_mode:
+                                print(f"[BBOX_ANALYSIS] No detections survived NMS")
+                    else:
+                        if debug_mode:
+                            print(f"[BBOX_ANALYSIS] No valid boxes after XYWH→XYXY conversion")
+                else:
+                    if debug_mode:
+                        print(f"[BBOX_ANALYSIS] No valid XYWH boxes found")
             else:
-                print(f"[DEBUG] Batch {batch_idx}: No valid boxes after filtering")
+                # 处理为 XYXY 格式
+                if debug_mode:
+                    print(f"[BBOX_ANALYSIS] Processing as XYXY format")
+                
+                valid_mask = valid_xyxy
+                
+                if debug_mode:
+                    print(f"[BBOX_ANALYSIS] XYXY valid detections: {valid_mask.sum().item()}/{len(coords)}")
+                
+                if valid_mask.sum() > 0:
+                    valid_detections = detections[valid_mask]
+                    boxes_xyxy = valid_detections[:, :4]
+                    scores = valid_detections[:, 4]
+                    labels = valid_detections[:, 6].long() if num_classes > 0 else torch.zeros(valid_mask.sum(), dtype=torch.long)
+                    
+                    # 按类别进行 NMS
+                    final_keep_indices = []
+                    for class_id in torch.unique(labels):
+                        class_mask = labels == class_id
+                        if class_mask.sum() == 0:
+                            continue
+                            
+                        class_boxes = boxes_xyxy[class_mask]
+                        class_scores = scores[class_mask]
+                        
+                        if len(class_boxes) > 0:
+                            keep = ops.nms(class_boxes, class_scores, iou_threshold=nms_thres)
+                            class_indices = torch.where(class_mask)[0]
+                            final_keep_indices.extend(class_indices[keep].tolist())
+                    
+                    if len(final_keep_indices) > 0:
+                        keep_tensor = torch.tensor(final_keep_indices, device=boxes_xyxy.device)
+                        
+                        det_dict = {
+                            'boxes': boxes_xyxy[keep_tensor].cpu(),
+                            'scores': scores[keep_tensor].cpu(),
+                            'labels': labels[keep_tensor].cpu()
+                        }
+                        batch_detections.append(det_dict)
+                        total_valid_boxes += len(keep_tensor)
+                        
+                        if debug_mode:
+                            print(f"[BBOX_ANALYSIS] Final XYXY detections after NMS: {len(keep_tensor)}")
+                    else:
+                        if debug_mode:
+                            print(f"[BBOX_ANALYSIS] No detections survived NMS")
+                else:
+                    if debug_mode:
+                        print(f"[BBOX_ANALYSIS] No valid XYXY boxes found")
+        
+        if not batch_detections:
+            if debug_mode:
+                print(f"[BBOX_ANALYSIS] Batch {batch_idx}: No final detections")
         
         output.append(batch_detections)
+        total_detections += len(batch_detections[0]) if batch_detections else 0
     
-    print(f"[DEBUG] Total detections across all batches: {total_detections}")
+    if debug_mode:
+        print(f"\n[BBOX_ANALYSIS] ========== FINAL SUMMARY ==========")
+        print(f"[BBOX_ANALYSIS] Total valid boxes across all batches: {total_valid_boxes}")
+        print(f"[BBOX_ANALYSIS] Batches with detections: {sum(1 for batch in output if batch)}")
+        print(f"[BBOX_ANALYSIS] Average detections per batch: {total_valid_boxes/batch_size:.2f}")
+        if total_valid_boxes == 0:
+            print(f"[BBOX_ANALYSIS] ⚠️  WARNING: No valid detections found!")
+            print(f"[BBOX_ANALYSIS] Possible issues:")
+            print(f"  1. Confidence threshold {conf_thres} too high")
+            print(f"  2. Coordinate format mismatch")
+            print(f"  3. Invalid coordinate values")
+            print(f"  4. NMS threshold {nms_thres} too strict")
+        else:
+            print(f"[BBOX_ANALYSIS] ✅ Successfully processed detections!")
+        print(f"[BBOX_ANALYSIS] =========================================\n")
+    
     return output
 
 def focal_loss(pred, target, alpha=0.25, gamma=2.0):
@@ -272,8 +501,8 @@ def unpack_fused_features(fused_feat):
 class DAGR(nn.Module):
     def __init__(self, args, height, width):
         super().__init__()
-        self.conf_threshold = 0.01  # 降低推理阈值
-        self.nms_threshold = 0.6
+        self.conf_threshold = 0.4
+        self.nms_threshold = 0.3
         self.height = height
         self.width = width
         self.args = args
@@ -404,7 +633,7 @@ class DAGR(nn.Module):
             
             if filtering:
                 if isinstance(outputs, torch.Tensor) and outputs.numel() > 0:
-                    batch_detections = postprocess_network_output(outputs, self.conf_threshold, self.nms_threshold)
+                    batch_detections = analyze_and_fix_postprocess(outputs, self.conf_threshold, self.nms_threshold, debug_mode=True)
                     outputs = []
                     for batch_det in batch_detections:
                         outputs.extend(batch_det)
@@ -505,7 +734,6 @@ class DAGR(nn.Module):
 
             return result
 
-        # 推理模式
         for i, f in enumerate(fused_feat):
             print(f"[DEBUG] Inference Feature {i}: x.shape = {f.x.shape}, height = {getattr(f, 'height', 'N/A')}, width = {getattr(f, 'width', 'N/A')}")
 
@@ -574,14 +802,14 @@ class DAGR(nn.Module):
                             
                             original_threshold = self.conf_threshold
                             self.conf_threshold = temp_threshold
-                            batch_detections = postprocess_network_output(outputs, self.conf_threshold, self.nms_threshold)
+                            batch_detections = analyze_and_fix_postprocess(outputs, self.conf_threshold, self.nms_threshold, debug_mode=True)
                             self.conf_threshold = original_threshold
                             
                             print(f"[DEBUG] Generated detections with lowered threshold: {len(batch_detections)}")
                         else:
-                            batch_detections = postprocess_network_output(outputs, self.conf_threshold, self.nms_threshold)
+                            batch_detections = analyze_and_fix_postprocess(outputs, self.conf_threshold, self.nms_threshold, debug_mode=True)
                     else:
-                        batch_detections = postprocess_network_output(outputs, self.conf_threshold, self.nms_threshold)
+                        batch_detections = analyze_and_fix_postprocess(outputs, self.conf_threshold, self.nms_threshold, debug_mode=True)
                     
                     outputs = []
                     for batch_det in batch_detections:
