@@ -15,6 +15,11 @@ class FCOSHead(nn.Module):
         self.cls_preds = nn.ModuleList()
         self.reg_preds = nn.ModuleList()
         self.centerness_preds = nn.ModuleList()
+        
+        # 损失权重因子
+        self.cls_factor = 1.0
+        self.reg_factor = 1.0
+        self.ctr_factor = 10.0
 
         for i, in_c in enumerate(in_channels):
             self.cls_convs.append(
@@ -56,11 +61,35 @@ class FCOSHead(nn.Module):
         else:
             return loss
 
+    def compute_centerness(self, left_right, top_bottom, epsilon=1e-6):
+        """安全计算centerness，防止NaN"""
+        # 确保所有值都是正的
+        left_right = F.relu(left_right) + epsilon
+        top_bottom = F.relu(top_bottom) + epsilon
+        
+        # 计算最小最大比
+        lr_ratio = torch.min(left_right, dim=1)[0] / torch.max(left_right, dim=1)[0]
+        tb_ratio = torch.min(top_bottom, dim=1)[0] / torch.max(top_bottom, dim=1)[0]
+        
+        # 确保比值在有效范围内
+        lr_ratio = torch.clamp(lr_ratio, min=epsilon, max=1.0)
+        tb_ratio = torch.clamp(tb_ratio, min=epsilon, max=1.0)
+        
+        # 计算centerness
+        centerness = torch.sqrt(lr_ratio * tb_ratio)
+        
+        # 最后一道防线：替换任何可能的NaN
+        centerness = torch.nan_to_num(centerness, nan=0.5)
+        
+        return centerness.clamp(min=0.0, max=1.0)
+
     def forward(self, feats, targets=None, training=False, hw=None):
         if not feats or len(feats) == 0:
             if training:
-                return dict(loss_cls=torch.tensor(0.0), loss_reg=torch.tensor(0.0), 
-                          loss_ctr=torch.tensor(0.0), total_loss=torch.tensor(0.0))
+                return dict(loss_cls=torch.tensor(0.0, device=self.cls_preds[0].weight.device), 
+                          loss_reg=torch.tensor(0.0, device=self.cls_preds[0].weight.device), 
+                          loss_ctr=torch.tensor(0.0, device=self.cls_preds[0].weight.device), 
+                          total_loss=torch.tensor(0.0, device=self.cls_preds[0].weight.device))
             else:
                 device = next(self.parameters()).device
                 return torch.zeros(1, 1, 5 + self.num_classes, device=device)
@@ -108,8 +137,11 @@ class FCOSHead(nn.Module):
         if len(cls_scores) == 0:
             print(f"[WARNING] No valid feature outputs generated")
             if training:
-                return dict(loss_cls=torch.tensor(0.0), loss_reg=torch.tensor(0.0), 
-                          loss_ctr=torch.tensor(0.0), total_loss=torch.tensor(0.0))
+                device = next(self.parameters()).device
+                return dict(loss_cls=torch.tensor(0.0, device=device), 
+                          loss_reg=torch.tensor(0.0, device=device), 
+                          loss_ctr=torch.tensor(0.0, device=device), 
+                          total_loss=torch.tensor(0.0, device=device))
             else:
                 device = next(self.parameters()).device
                 return torch.zeros(1, 1, 5 + self.num_classes, device=device)
@@ -151,9 +183,13 @@ class FCOSHead(nn.Module):
         all_reg_preds = torch.cat(flat_reg_preds, dim=1)
         all_centernesses = torch.cat(flat_centernesses, dim=1)
 
-        losses = dict(loss_cls=0.0, loss_reg=0.0, loss_ctr=0.0)
+        losses = dict(
+            loss_cls=torch.tensor(0.0, device=device),
+            loss_reg=torch.tensor(0.0, device=device),
+            loss_ctr=torch.tensor(0.0, device=device)
+        )
         num_pos_total = 0
-
+        num_batches_with_pos = 0
         B = min_batch_size
 
         for batch_idx in range(B):
@@ -235,61 +271,73 @@ class FCOSHead(nn.Module):
             if num_pos == 0:
                 continue
 
+            num_batches_with_pos += 1
             matched_inds = min_inds[pos_mask]
             matched_boxes = gt_boxes[matched_inds]
             matched_cls = gt_cls[matched_inds]
 
             cls_target = torch.zeros_like(all_cls_scores[batch_idx])
             cls_target[pos_mask, matched_cls] = 1.0
-            loss_cls = self.focal_loss(all_cls_scores[batch_idx], cls_target, alpha=0.25, gamma=2.0) / max(num_pos, 1)
-
-            matched_x1y1 = matched_boxes[:, :2] - matched_boxes[:, 2:] / 2
-            matched_x2y2 = matched_boxes[:, :2] + matched_boxes[:, 2:] / 2
-            matched_l = points[pos_mask][:, 0] - matched_x1y1[:, 0]
-            matched_t = points[pos_mask][:, 1] - matched_x1y1[:, 1]
-            matched_r = matched_x2y2[:, 0] - points[pos_mask][:, 0]
-            matched_b = matched_x2y2[:, 1] - points[pos_mask][:, 1]
-            reg_target = torch.stack([matched_l, matched_t, matched_r, matched_b], dim=1)
-
-            reg_pred = all_reg_preds[batch_idx][pos_mask]
-            iou_loss = self._loss_iou(reg_pred, reg_target).mean()
-
-            left_right = reg_target[:, [0, 2]]
-            top_bottom = reg_target[:, [1, 3]]
             
-            # 添加epsilon防止除零
-            epsilon = 1e-6
+            # 计算分类损失
+            try:
+                loss_cls = self.focal_loss(all_cls_scores[batch_idx], cls_target, alpha=0.25, gamma=2.0) / max(num_pos, 1)
+                if torch.isnan(loss_cls).any():
+                    print(f"[WARNING] NaN in loss_cls, setting to zero")
+                    loss_cls = torch.tensor(0.0, device=device)
+            except Exception as e:
+                print(f"[ERROR] Failed to compute cls loss: {e}")
+                loss_cls = torch.tensor(0.0, device=device)
             
-            # 检查并过滤无效值
-            valid_mask = (left_right.max(dim=1)[0] > epsilon) & (top_bottom.max(dim=1)[0] > epsilon)
-            
-            if valid_mask.sum() > 0:
-                # 只对有效样本计算centerness
-                left_right_valid = left_right[valid_mask]
-                top_bottom_valid = top_bottom[valid_mask]
+            # 计算回归损失
+            try:
+                matched_x1y1 = matched_boxes[:, :2] - matched_boxes[:, 2:] / 2
+                matched_x2y2 = matched_boxes[:, :2] + matched_boxes[:, 2:] / 2
+                matched_l = points[pos_mask][:, 0] - matched_x1y1[:, 0]
+                matched_t = points[pos_mask][:, 1] - matched_x1y1[:, 1]
+                matched_r = matched_x2y2[:, 0] - points[pos_mask][:, 0]
+                matched_b = matched_x2y2[:, 1] - points[pos_mask][:, 1]
+                reg_target = torch.stack([matched_l, matched_t, matched_r, matched_b], dim=1)
                 
-                centerness_valid = (left_right_valid.min(dim=1)[0] / (left_right_valid.max(dim=1)[0] + epsilon)) * \
-                               (top_bottom_valid.min(dim=1)[0] / (top_bottom_valid.max(dim=1)[0] + epsilon))
-                centerness_valid = torch.sqrt(centerness_valid).clamp(0, 1).detach()
+                reg_pred = all_reg_preds[batch_idx][pos_mask]
                 
-                # 创建完整的centerness张量，对无效位置填充0.5（表示中性）
-                centerness = torch.ones_like(left_right[:, 0]) * 0.5
-                centerness[valid_mask] = centerness_valid
+                # 过滤无效回归目标
+                valid_reg_mask = (reg_target > 0).all(dim=1)
+                if valid_reg_mask.sum() > 0:
+                    iou_loss = self._loss_iou(
+                        reg_pred[valid_reg_mask], 
+                        reg_target[valid_reg_mask]
+                    ).mean()
+                    
+                    if torch.isnan(iou_loss).any():
+                        print(f"[WARNING] NaN in iou_loss, setting to zero")
+                        iou_loss = torch.tensor(0.0, device=device)
+                else:
+                    iou_loss = torch.tensor(0.0, device=device)
+            except Exception as e:
+                print(f"[ERROR] Failed to compute reg loss: {e}")
+                iou_loss = torch.tensor(0.0, device=device)
+
+            # 计算centerness损失
+            try:
+                left_right = reg_target[:, [0, 2]]
+                top_bottom = reg_target[:, [1, 3]]
                 
+                # 使用安全的centerness计算函数
+                centerness = self.compute_centerness(left_right, top_bottom)
                 pred_ctr = all_centernesses[batch_idx][pos_mask].squeeze(-1)
                 
                 if pred_ctr.numel() > 0:
-                    # 只对有效位置计算loss
-                    pred_ctr_valid = pred_ctr[valid_mask]
-                    if pred_ctr_valid.numel() > 0:
-                        loss_ctr = F.binary_cross_entropy_with_logits(pred_ctr_valid, centerness_valid, reduction='mean')
-                    else:
+                    loss_ctr = F.binary_cross_entropy_with_logits(
+                        pred_ctr, centerness, reduction='mean')
+                    
+                    if torch.isnan(loss_ctr).any():
+                        print(f"[WARNING] NaN in loss_ctr, setting to zero")
                         loss_ctr = torch.tensor(0.0, device=device)
                 else:
                     loss_ctr = torch.tensor(0.0, device=device)
-            else:
-                # 所有样本都无效，返回零loss
-                centerness = torch.ones_like(left_right[:, 0]) * 0.5
+            except Exception as e:
+                print(f"[ERROR] Failed to compute ctr loss: {e}")
                 loss_ctr = torch.tensor(0.0, device=device)
 
             losses['loss_cls'] += loss_cls
@@ -300,9 +348,31 @@ class FCOSHead(nn.Module):
         if num_pos_total > 0:
             print(f"[TRAIN] Found {num_pos_total} positive samples across batch")
         
+        # 平均损失
         for k in losses:
-            losses[k] = losses[k] / max(B, 1)
-        losses['total_loss'] = losses['loss_cls'] + losses['loss_reg'] + losses['loss_ctr']
+            losses[k] = losses[k] / max(num_batches_with_pos, 1)
+            # 确保没有NaN
+            if torch.isnan(losses[k]).any():
+                print(f"[WARNING] Final {k} is NaN, replacing with zero")
+                losses[k] = torch.tensor(0.0, device=device)
+        
+        # 计算总损失 - 应用权重系数
+        weighted_cls_loss = self.cls_factor * losses['loss_cls']
+        weighted_reg_loss = self.reg_factor * losses['loss_reg'] 
+        weighted_ctr_loss = self.ctr_factor * losses['loss_ctr']
+        
+        # 使用加权损失计算总损失
+        losses['total_loss'] = weighted_cls_loss + weighted_reg_loss + weighted_ctr_loss
+        
+        # 记录原始损失和加权损失，用于调试
+        losses['weighted_cls_loss'] = weighted_cls_loss
+        losses['weighted_reg_loss'] = weighted_reg_loss 
+        losses['weighted_ctr_loss'] = weighted_ctr_loss
+        
+        # 打印损失权重信息
+        print(f"[LOSS WEIGHTS] cls:{self.cls_factor}, reg:{self.reg_factor}, ctr:{self.ctr_factor}")
+        print(f"[WEIGHTED LOSS] cls:{weighted_cls_loss.item():.4f}, reg:{weighted_reg_loss.item():.4f}, ctr:{weighted_ctr_loss.item():.4f}")
+        
         return losses
 
     def decode_outputs(self, cls_scores, reg_preds, centernesses):
@@ -414,6 +484,13 @@ class FCOSHead(nn.Module):
                     scores = max_scores[mask]
                     labels = labels[mask].long()
                     detection_count += len(boxes)
+
+                    # 记录边界框统计信息（宽高）
+                    widths = boxes[:, 2] - boxes[:, 0]
+                    heights = boxes[:, 3] - boxes[:, 1]
+                    if batch_idx == 0 and level_idx == 0:
+                        print(f"[BOX STATS] Width: min={widths.min().item():.6f}, max={widths.max().item():.6f}, mean={widths.mean().item():.6f}")
+                        print(f"[BOX STATS] Height: min={heights.min().item():.6f}, max={heights.max().item():.6f}, mean={heights.mean().item():.6f}")
 
                     for class_id in torch.unique(labels):
                         class_id = int(class_id.item())
