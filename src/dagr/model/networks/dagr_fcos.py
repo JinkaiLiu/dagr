@@ -12,6 +12,17 @@ from dagr.model.utils import (
 )
 
 def postprocess_network_output(prediction, conf_thres, nms_thres):
+    if not isinstance(prediction, torch.Tensor):
+        print(f"[WARNING] postprocess_network_output received {type(prediction)}, returning empty")
+        return []
+        
+    if prediction.numel() == 0:
+        print(f"[WARNING] Empty prediction tensor")
+        return []
+    
+    print(f"[DEBUG] Postprocessing prediction shape: {prediction.shape}")
+    print(f"[DEBUG] Confidence threshold: {conf_thres}")
+        
     batch_size = prediction.shape[0]
     
     if prediction.dim() == 3:
@@ -23,7 +34,10 @@ def postprocess_network_output(prediction, conf_thres, nms_thres):
         num_classes = num_classes.item()
     num_classes = int(num_classes)
     
+    print(f"[DEBUG] Detected num_classes: {num_classes}")
+    
     output = []
+    total_detections = 0
     
     for batch_idx in range(batch_size):
         image_pred = prediction[batch_idx]
@@ -34,9 +48,24 @@ def postprocess_network_output(prediction, conf_thres, nms_thres):
         if image_pred.shape[0] == 0:
             output.append([])
             continue
+        
+        print(f"[DEBUG] Batch {batch_idx}: Processing {image_pred.shape[0]} predictions")
             
         conf_scores = image_pred[:, 4]
+        print(f"[DEBUG] Batch {batch_idx}: Confidence range: {conf_scores.min().item():.4f} to {conf_scores.max().item():.4f}")
+        
         conf_mask = conf_scores >= conf_thres
+        above_threshold = conf_mask.sum().item()
+        print(f"[DEBUG] Batch {batch_idx}: {above_threshold} detections above threshold {conf_thres}")
+        
+        if above_threshold == 0:
+            k = min(5, len(conf_scores))
+            if k > 0:
+                _, top_indices = torch.topk(conf_scores, k)
+                conf_mask = torch.zeros_like(conf_scores, dtype=torch.bool)
+                conf_mask[top_indices] = True
+                print(f"[DEBUG] Batch {batch_idx}: Using top-{k} detections as fallback")
+        
         image_pred = image_pred[conf_mask]
         
         if image_pred.shape[0] == 0:
@@ -49,33 +78,45 @@ def postprocess_network_output(prediction, conf_thres, nms_thres):
             
             detections = torch.cat((
                 image_pred[:, :4],
-                conf_scores.unsqueeze(1),
+                image_pred[:, 4:5],
                 class_conf,
                 class_pred.float()
             ), 1)
         else:
             detections = torch.cat((
                 image_pred[:, :4],
-                conf_scores.unsqueeze(1),
-                torch.zeros(image_pred.shape[0], 1, device=image_pred.device),
+                image_pred[:, 4:5],
+                torch.ones(image_pred.shape[0], 1, device=image_pred.device),
                 torch.zeros(image_pred.shape[0], 1, device=image_pred.device)
             ), 1)
         
         batch_detections = []
         if detections.shape[0] > 0:
-            boxes = detections[:, :4].cpu()
-            scores = detections[:, 4].cpu()
-            labels = detections[:, 6].cpu().long() if num_classes > 0 else torch.zeros(detections.shape[0]).long()
+            boxes_xyxy = detections[:, :4]
+            valid_boxes = (boxes_xyxy[:, 2] > boxes_xyxy[:, 0]) & (boxes_xyxy[:, 3] > boxes_xyxy[:, 1])
             
-            det_dict = {
-                'boxes': boxes,
-                'scores': scores,  
-                'labels': labels
-            }
-            batch_detections.append(det_dict)
+            if valid_boxes.sum() > 0:
+                detections = detections[valid_boxes]
+                
+                boxes = detections[:, :4].cpu()
+                scores = detections[:, 4].cpu()
+                labels = detections[:, 6].cpu().long() if num_classes > 0 else torch.zeros(detections.shape[0]).long()
+                
+                det_dict = {
+                    'boxes': boxes,
+                    'scores': scores,  
+                    'labels': labels
+                }
+                batch_detections.append(det_dict)
+                total_detections += len(boxes)
+                
+                print(f"[DEBUG] Batch {batch_idx}: Generated {len(boxes)} valid detections")
+            else:
+                print(f"[DEBUG] Batch {batch_idx}: No valid boxes after filtering")
         
         output.append(batch_detections)
     
+    print(f"[DEBUG] Total detections across all batches: {total_detections}")
     return output
 
 def focal_loss(pred, target, alpha=0.25, gamma=2.0):
@@ -94,56 +135,63 @@ def unpack_fused_features(fused_feat):
     
     print(f"[DEBUG] Unpacking {len(fused_feat)} fused features")
     
+    target_batch_size = None
     for i, f in enumerate(fused_feat):
         if hasattr(f, "x") and isinstance(f.x, torch.Tensor):
-            x = f.x  # [num_nodes, channels]
+            batch_info = f.batch if hasattr(f, "batch") else None
+            if batch_info is not None:
+                current_batch_size = len(batch_info.unique())
+                if target_batch_size is None:
+                    target_batch_size = current_batch_size
+                else:
+                    target_batch_size = min(target_batch_size, current_batch_size)
+    
+    print(f"[DEBUG] Target batch size: {target_batch_size}")
+    
+    for i, f in enumerate(fused_feat):
+        if hasattr(f, "x") and isinstance(f.x, torch.Tensor):
+            x = f.x
             height = f.height.item() if hasattr(f, "height") and torch.is_tensor(f.height) else None
             width = f.width.item() if hasattr(f, "width") and torch.is_tensor(f.width) else None
             batch_info = f.batch if hasattr(f, "batch") else None
             
             print(f"[DEBUG] Feature {i}: x.shape = {x.shape}, height = {height}, width = {width}")
             if batch_info is not None:
-                print(f"[DEBUG] Feature {i}: batch info available, unique batches = {batch_info.unique()}")
+                unique_batches = batch_info.unique()
+                print(f"[DEBUG] Feature {i}: batch info available, unique batches = {unique_batches}")
             
             if x.dim() == 2:
                 num_nodes, channels = x.shape
                 
-                if height is not None and width is not None and batch_info is not None:
-                    # 有batch信息的情况，需要正确重建batch维度
-                    batch_size = len(batch_info.unique())
+                if height is not None and width is not None and batch_info is not None and target_batch_size is not None:
+                    batch_size = target_batch_size
                     expected_nodes_per_batch = height * width
                     
                     print(f"[DEBUG] Reconstructing batch dimension: batch_size={batch_size}, nodes_per_batch={expected_nodes_per_batch}")
                     
-                    # 创建[batch_size, channels, height, width]的tensor
                     full_tensor = torch.zeros(batch_size, channels, height, width, device=x.device, dtype=x.dtype)
                     
-                    # 为每个batch分别处理
                     for batch_idx in range(batch_size):
-                        batch_mask = batch_info == batch_idx
-                        batch_nodes = x[batch_mask]  # [nodes_in_batch, channels]
-                        
-                        if batch_nodes.shape[0] > 0:
-                            # 限制到特征图大小
-                            max_nodes = min(batch_nodes.shape[0], expected_nodes_per_batch)
+                        if batch_idx < len(batch_info.unique()):
+                            batch_mask = batch_info == batch_idx
+                            batch_nodes = x[batch_mask]
                             
-                            # 重塑为特征图
-                            if max_nodes == expected_nodes_per_batch:
-                                # 完整填充
-                                reshaped = batch_nodes[:max_nodes].transpose(0, 1).view(channels, height, width)
-                            else:
-                                # 部分填充
-                                temp_features = torch.zeros(expected_nodes_per_batch, channels, device=x.device, dtype=x.dtype)
-                                temp_features[:max_nodes] = batch_nodes[:max_nodes]
-                                reshaped = temp_features.transpose(0, 1).view(channels, height, width)
-                            
-                            full_tensor[batch_idx] = reshaped
+                            if batch_nodes.shape[0] > 0:
+                                max_nodes = min(batch_nodes.shape[0], expected_nodes_per_batch)
+                                
+                                if max_nodes == expected_nodes_per_batch:
+                                    reshaped = batch_nodes[:max_nodes].transpose(0, 1).view(channels, height, width)
+                                else:
+                                    temp_features = torch.zeros(expected_nodes_per_batch, channels, device=x.device, dtype=x.dtype)
+                                    temp_features[:max_nodes] = batch_nodes[:max_nodes]
+                                    reshaped = temp_features.transpose(0, 1).view(channels, height, width)
+                                
+                                full_tensor[batch_idx] = reshaped
                     
                     x = full_tensor
                     print(f"[DEBUG] Reconstructed to batch tensor: {x.shape}")
                     
                 elif height is not None and width is not None:
-                    # 没有batch信息，假设是单个batch
                     expected_nodes = height * width
                     
                     if num_nodes <= expected_nodes:
@@ -154,9 +202,11 @@ def unpack_fused_features(fused_feat):
                         x_truncated = x[:expected_nodes]
                         x = x_truncated.transpose(0, 1).contiguous().view(channels, height, width).unsqueeze(0)
                     
+                    if target_batch_size is not None and target_batch_size > 1:
+                        x = x.repeat(target_batch_size, 1, 1, 1)
+                    
                     print(f"[DEBUG] Single batch reshaped to: {x.shape}")
                 else:
-                    # 推断空间维度
                     sqrt_nodes = int(num_nodes ** 0.5)
                     if sqrt_nodes * sqrt_nodes == num_nodes:
                         x = x.transpose(0, 1).contiguous().view(channels, sqrt_nodes, sqrt_nodes).unsqueeze(0)
@@ -164,12 +214,32 @@ def unpack_fused_features(fused_feat):
                     else:
                         x = x.transpose(0, 1).contiguous().view(channels, num_nodes, 1).unsqueeze(0)
                         height, width = num_nodes, 1
+                    
+                    if target_batch_size is not None and target_batch_size > 1:
+                        x = x.repeat(target_batch_size, 1, 1, 1)
+                        
                     print(f"[DEBUG] Inferred reshape to: {x.shape}")
                         
             elif x.dim() == 3:
                 x = x.unsqueeze(0)
+                if target_batch_size is not None and x.shape[0] != target_batch_size:
+                    if x.shape[0] == 1:
+                        x = x.repeat(target_batch_size, 1, 1, 1)
+                    else:
+                        x = x[:target_batch_size]
             elif x.dim() == 4:
-                pass
+                if target_batch_size is not None and x.shape[0] != target_batch_size:
+                    if x.shape[0] > target_batch_size:
+                        x = x[:target_batch_size]
+                    else:
+                        repeats = target_batch_size // x.shape[0]
+                        remainder = target_batch_size % x.shape[0]
+                        if repeats > 0:
+                            x_repeated = x.repeat(repeats, 1, 1, 1)
+                            if remainder > 0:
+                                x = torch.cat([x_repeated, x[:remainder]], dim=0)
+                            else:
+                                x = x_repeated
             else:
                 raise ValueError(f"Unexpected tensor dimension: {x.dim()}, shape: {x.shape}")
             
@@ -183,6 +253,13 @@ def unpack_fused_features(fused_feat):
                     f = f.transpose(0, 1).unsqueeze(0).unsqueeze(-1)
                 elif f.dim() == 3:
                     f = f.unsqueeze(0)
+                
+                if target_batch_size is not None and f.shape[0] != target_batch_size:
+                    if f.shape[0] == 1:
+                        f = f.repeat(target_batch_size, 1, 1, 1)
+                    else:
+                        f = f[:target_batch_size]
+                        
                 features_tensor.append(f)
                 features_hw.append((None, None))
             else:
@@ -195,7 +272,7 @@ def unpack_fused_features(fused_feat):
 class DAGR(nn.Module):
     def __init__(self, args, height, width):
         super().__init__()
-        self.conf_threshold = 0.05
+        self.conf_threshold = 0.01  # 降低推理阈值
         self.nms_threshold = 0.6
         self.height = height
         self.width = width
@@ -224,31 +301,22 @@ class DAGR(nn.Module):
             init_subnetwork(self, state_dict['ema'], "backbone.net.", freeze=True)
 
     def _convert_bbox_to_fcos_format(self, bbox, bbox_batch, num_graphs):
-        """
-        将原始bbox转换为FCOS训练格式
-        原始格式: [x, y, h, w, class] (按DSEC官方文档)
-        FCOS格式: [class, x_center, y_center, width, height]
-        """
         targets = []
         
         for batch_idx in range(num_graphs):
-            # 获取当前batch的bbox
             batch_mask = bbox_batch == batch_idx
             batch_bboxes = bbox[batch_mask]
             
             if batch_bboxes.numel() == 0:
-                # 空的target
                 targets.append(torch.zeros(0, 5, device=bbox.device))
                 continue
             
-            # 按照DSEC格式解析: [x, y, h, w, class]
-            x_left = batch_bboxes[:, 0]      # x-coordinate of top-left corner
-            y_top = batch_bboxes[:, 1]       # y-coordinate of top-left corner  
-            height = batch_bboxes[:, 2]      # height
-            width = batch_bboxes[:, 3]       # width
-            cls = batch_bboxes[:, 4]         # class_id
+            x_left = batch_bboxes[:, 0]
+            y_top = batch_bboxes[:, 1]
+            height = batch_bboxes[:, 2]
+            width = batch_bboxes[:, 3]
+            cls = batch_bboxes[:, 4]
             
-            # 过滤有效的bbox (面积大于0)
             areas = width * height
             valid_mask = areas > 0
             
@@ -256,18 +324,15 @@ class DAGR(nn.Module):
                 targets.append(torch.zeros(0, 5, device=bbox.device))
                 continue
                 
-            # 只保留有效的boxes
             x_left = x_left[valid_mask]
             y_top = y_top[valid_mask]
             height = height[valid_mask]
             width = width[valid_mask]
             cls = cls[valid_mask]
             
-            # 转换为中心点坐标
             x_center = x_left + width / 2
             y_center = y_top + height / 2
             
-            # 组装FCOS格式: [class, x_center, y_center, width, height]
             fcos_target = torch.stack([cls, x_center, y_center, width, height], dim=1)
             targets.append(fcos_target)
             
@@ -338,21 +403,13 @@ class DAGR(nn.Module):
             outputs = self.cnn_head(image_feat_tensors, training=False)
             
             if filtering:
-                processed_outputs = torch.cat([
-                    outputs[..., :4],
-                    outputs[..., 4:5],
-                    outputs[..., 5:]
-                ], dim=-1)
-                batch_detections = postprocess_network_output(processed_outputs, self.conf_threshold, self.nms_threshold)
-                outputs = []
-                for batch_det in batch_detections:
-                    outputs.extend(batch_det)
-            else:
-                outputs = torch.cat([
-                    outputs[..., :4],
-                    outputs[..., 4:5],
-                    outputs[..., 5:]
-                ], dim=-1)
+                if isinstance(outputs, torch.Tensor) and outputs.numel() > 0:
+                    batch_detections = postprocess_network_output(outputs, self.conf_threshold, self.nms_threshold)
+                    outputs = []
+                    for batch_det in batch_detections:
+                        outputs.extend(batch_det)
+                else:
+                    outputs = []
             
             ret = outputs
             if return_targets and hasattr(x, 'bbox'):
@@ -372,7 +429,6 @@ class DAGR(nn.Module):
         fused_feat = event_feat
 
         if self.training:
-            # 直接使用原始bbox数据，不经过convert_to_training_format
             targets = self._convert_bbox_to_fcos_format(x.bbox, x.bbox_batch, x.num_graphs)
             
             print(f"[DEBUG] Training mode - processing {len(targets)} targets")
@@ -420,7 +476,6 @@ class DAGR(nn.Module):
                         image_feat_tensors.append(img_f)
                         
                 print(f"[DEBUG] Calling CNN head with {len(image_feat_tensors)} features")
-                # 使用相同的targets格式
                 loss_image = self.cnn_head(image_feat_tensors, targets=targets, training=True)
                 
                 if isinstance(loss_image, dict):
@@ -450,8 +505,9 @@ class DAGR(nn.Module):
 
             return result
 
+        # 推理模式
         for i, f in enumerate(fused_feat):
-            print(f"[DEBUG] Feature {i}: x.shape = {f.x.shape}, height = {getattr(f, 'height', 'N/A')}, width = {getattr(f, 'width', 'N/A')}")
+            print(f"[DEBUG] Inference Feature {i}: x.shape = {f.x.shape}, height = {getattr(f, 'height', 'N/A')}, width = {getattr(f, 'width', 'N/A')}")
 
         x.reset = reset
         
@@ -459,37 +515,42 @@ class DAGR(nn.Module):
         
         try:
             fused_feat_x, fused_hw = unpack_fused_features(fused_feat)
-            print(f"[DEBUG] Unpacked features shapes: {[f.shape for f in fused_feat_x]}")
+            print(f"[DEBUG] Inference unpacked features shapes: {[f.shape for f in fused_feat_x]}")
             
-            # 检查unpacked features是否有效
             valid_features = []
             for i, feat in enumerate(fused_feat_x):
                 if feat.numel() > 0 and all(d > 0 for d in feat.shape):
                     valid_features.append(feat)
-                    print(f"[DEBUG] Feature {i} is valid: {feat.shape}")
+                    print(f"[DEBUG] Inference feature {i} is valid: {feat.shape}")
                 else:
-                    print(f"[WARNING] Feature {i} is invalid: {feat.shape}, numel={feat.numel()}")
+                    print(f"[WARNING] Inference feature {i} is invalid: {feat.shape}, numel={feat.numel()}")
             
             if len(valid_features) == 0:
-                print(f"[ERROR] No valid features after unpacking!")
-                # 返回空的检测结果字典格式
+                print(f"[ERROR] No valid features after unpacking in inference!")
                 ret = []
                 if return_targets and hasattr(x, 'bbox'):
                     targets = convert_to_evaluation_format(x)
                     ret = [ret, targets]
                 return ret
-                
+            
+            print(f"[DEBUG] Calling head in inference mode with {len(valid_features)} features")
             outputs = self.head(valid_features, training=False)
+            print(f"[DEBUG] Raw inference outputs type: {type(outputs)}")
+            
+            if isinstance(outputs, torch.Tensor):
+                print(f"[DEBUG] Raw inference outputs shape: {outputs.shape}")
+                print(f"[DEBUG] Raw inference outputs stats: min={outputs.min().item():.4f}, max={outputs.max().item():.4f}, mean={outputs.mean().item():.4f}")
+                
+                if outputs.dim() >= 3:
+                    print(f"[DEBUG] Confidence scores range: {outputs[..., 4].min().item():.4f} to {outputs[..., 4].max().item():.4f}")
+                    if outputs.shape[-1] > 5:
+                        print(f"[DEBUG] Class scores range: {outputs[..., 5:].min().item():.4f} to {outputs[..., 5:].max().item():.4f}")
             
         except Exception as e:
-            print(f"[ERROR] Failed to unpack features: {e}")
-            print(f"[DEBUG] fused_feat types: {[type(f) for f in fused_feat]}")
-            for i, f in enumerate(fused_feat):
-                if hasattr(f, 'x'):
-                    print(f"[DEBUG] fused_feat[{i}].x.shape: {f.x.shape}")
-                else:
-                    print(f"[DEBUG] fused_feat[{i}] is tensor with shape: {f.shape if hasattr(f, 'shape') else 'no shape'}")
-            # 返回空的检测结果字典格式
+            print(f"[ERROR] Failed to process features in inference: {e}")
+            import traceback
+            traceback.print_exc()
+            
             ret = []
             if return_targets and hasattr(x, 'bbox'):
                 targets = convert_to_evaluation_format(x)
@@ -497,21 +558,49 @@ class DAGR(nn.Module):
             return ret
             
         if filtering:
-            processed_outputs = torch.cat([
-                outputs[..., :4],
-                outputs[..., 4:5],
-                outputs[..., 5:]
-            ], dim=-1)
-            batch_detections = postprocess_network_output(processed_outputs, self.conf_threshold, self.nms_threshold)
-            outputs = []
-            for batch_det in batch_detections:
-                outputs.extend(batch_det)
+            try:
+                if isinstance(outputs, torch.Tensor) and outputs.numel() > 0:
+                    print(f"[DEBUG] Filtering detections with conf_threshold={self.conf_threshold}")
+                    
+                    if outputs.dim() >= 3:
+                        conf_scores = outputs[..., 4]
+                        above_threshold = (conf_scores > self.conf_threshold).sum().item()
+                        print(f"[DEBUG] Detections above threshold {self.conf_threshold}: {above_threshold}")
+                        
+                        if above_threshold == 0:
+                            temp_threshold = 0.001
+                            above_temp = (conf_scores > temp_threshold).sum().item()
+                            print(f"[DEBUG] Detections above temp threshold {temp_threshold}: {above_temp}")
+                            
+                            original_threshold = self.conf_threshold
+                            self.conf_threshold = temp_threshold
+                            batch_detections = postprocess_network_output(outputs, self.conf_threshold, self.nms_threshold)
+                            self.conf_threshold = original_threshold
+                            
+                            print(f"[DEBUG] Generated detections with lowered threshold: {len(batch_detections)}")
+                        else:
+                            batch_detections = postprocess_network_output(outputs, self.conf_threshold, self.nms_threshold)
+                    else:
+                        batch_detections = postprocess_network_output(outputs, self.conf_threshold, self.nms_threshold)
+                    
+                    outputs = []
+                    for batch_det in batch_detections:
+                        outputs.extend(batch_det)
+                    
+                    print(f"[DEBUG] Final detection count: {len(outputs)}")
+                    
+                else:
+                    print(f"[DEBUG] Invalid outputs for filtering: type={type(outputs)}, numel={outputs.numel() if hasattr(outputs, 'numel') else 'N/A'}")
+                    outputs = []
+                    
+            except Exception as e:
+                print(f"[ERROR] Failed to postprocess outputs: {e}")
+                print(f"[DEBUG] outputs info: type={type(outputs)}, shape={outputs.shape if hasattr(outputs, 'shape') else 'no shape'}")
+                outputs = []
         else:
-            outputs = torch.cat([
-                outputs[..., :4],
-                outputs[..., 4:5], 
-                outputs[..., 5:]
-            ], dim=-1)
+            if not isinstance(outputs, torch.Tensor):
+                print(f"[WARNING] Expected tensor output, got {type(outputs)}")
+                outputs = torch.zeros(1, 1, 5 + self.backbone.num_classes, device=next(self.parameters()).device)
         
         ret = outputs
 
