@@ -27,6 +27,47 @@ from dagr.data.dsec_data import DSEC
 from dagr.model.networks.dagr_fcos import DAGR
 from dagr.model.networks.ema import ModelEMA
 
+def debug_data_format(data, targets=None):
+    """调试数据和标签格式"""
+    print(f"\n[DATA DEBUG] ========== Data Format Debug ==========")
+    print(f"[DATA DEBUG] Data batch info:")
+    print(f"  - data.x.shape: {data.x.shape if hasattr(data, 'x') else 'No x'}")
+    print(f"  - data.pos.shape: {data.pos.shape if hasattr(data, 'pos') else 'No pos'}")
+    print(f"  - data.batch: {data.batch.shape if hasattr(data, 'batch') else 'No batch'}")
+    print(f"  - data.num_graphs: {data.num_graphs if hasattr(data, 'num_graphs') else 'No num_graphs'}")
+    
+    if hasattr(data, 'bbox'):
+        print(f"  - data.bbox.shape: {data.bbox.shape}")
+        print(f"  - data.bbox_batch.shape: {data.bbox_batch.shape if hasattr(data, 'bbox_batch') else 'No bbox_batch'}")
+        
+        bbox_stats = {
+            'min': data.bbox.min(0)[0],
+            'max': data.bbox.max(0)[0],
+            'mean': data.bbox.mean(0),
+            'std': data.bbox.std(0)
+        }
+        print(f"  - BBox statistics:")
+        for k, v in bbox_stats.items():
+            print(f"    {k}: {v}")
+        
+        non_zero_boxes = (data.bbox.sum(dim=1) != 0).sum().item()
+        print(f"  - Non-zero boxes: {non_zero_boxes} / {data.bbox.shape[0]}")
+        
+        print(f"  - Sample bboxes:")
+        for i in range(min(10, data.bbox.shape[0])):
+            print(f"    [{i}]: {data.bbox[i]}")
+    
+    if targets is not None:
+        print(f"[DATA DEBUG] Targets info:")
+        for i, target in enumerate(targets):
+            if target.numel() > 0:
+                print(f"  - Target {i}: shape={target.shape}")
+                print(f"    Sample: {target[0] if len(target) > 0 else 'empty'}")
+                non_zero = (target[:, 1:].sum(dim=1) != 0).sum().item()
+                print(f"    Non-zero: {non_zero} / {target.shape[0]}")
+    
+    print(f"[DATA DEBUG] =====================================\n")
+
 def gradients_broken(model):
     for name, param in model.named_parameters():
         if param.grad is not None and torch.isnan(param.grad).any():
@@ -55,6 +96,9 @@ def train(loader: DataLoader,
         data = data.cuda(non_blocking=True)
         data = format_data(data)
 
+        if i == 0:
+            debug_data_format(data)
+
         optimizer.zero_grad(set_to_none=True)
 
         model_outputs = model(data)
@@ -64,13 +108,11 @@ def train(loader: DataLoader,
         loss_fusion = loss_dict.get("fusion_total_loss", 0.0)
         loss_cnn = loss_dict.get("cnn_total_loss", 0.0)
         
-        # 确保损失是张量，处理嵌套字典的情况
         if isinstance(loss_fusion, dict):
             loss_fusion = loss_fusion.get("total_loss", 0.0)
         if isinstance(loss_cnn, dict):
             loss_cnn = loss_cnn.get("total_loss", 0.0)
         
-        # 确保损失是张量类型，如果是标量则转换为张量
         device = next(model.parameters()).device
         if not torch.is_tensor(loss_fusion):
             loss_fusion = torch.tensor(float(loss_fusion), device=device, requires_grad=True)
@@ -79,7 +121,6 @@ def train(loader: DataLoader,
             
         loss = loss_fusion + lambda_cnn * loss_cnn
         
-        # 确保总损失也是张量
         if not torch.is_tensor(loss):
             loss = torch.tensor(float(loss), device=device, requires_grad=True)
 
@@ -103,19 +144,18 @@ def train(loader: DataLoader,
                 running_losses[k] = []
             running_losses[k].append(v_value)
 
-        if (i + 1) % 10 == 0:
-            avg_losses = {k: sum(v[-10:]) / len(v[-10:]) for k, v in running_losses.items()}
+        if (i + 1) % 50 == 0:
+            avg_losses = {k: sum(v[-50:]) / len(v[-50:]) for k, v in running_losses.items()}
             current_lr = scheduler.get_last_lr()[-1]
             
             print(f"Iteration {i+1}/{len(loader)}:")
-            print(f"  Total Loss: {loss_value:.4f} (avg: {sum(running_losses.get('total', [loss_value])[-10:]) / min(10, len(running_losses.get('total', [loss_value]))):.4f})")
+            print(f"  Total Loss: {loss_value:.4f} (avg: {sum(running_losses.get('total', [loss_value])[-50:]) / min(50, len(running_losses.get('total', [loss_value]))):.4f})")
             print(f"  Learning Rate: {current_lr:.6f}")
             
             for k, v in avg_losses.items():
                 clean_key = k.replace("_", " ").title()
                 print(f"  {clean_key}: {v:.4f}")
             print("-" * 50)
-
 
         loss.backward()
         torch.nn.utils.clip_grad_value_(model.parameters(), args.clip)
@@ -224,14 +264,19 @@ if __name__ == '__main__':
     lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_func)
 
     checkpointer = Checkpointer(output_directory=output_directory, args=args, optimizer=optimizer, scheduler=lr_scheduler, ema=ema, model=model)
-    start_epoch = checkpointer.restore_if_existing(output_directory, resume_from_best=True) or 0
+    
+    try:
+        start_epoch = checkpointer.restore_if_existing(output_directory, resume_from_best=True) or 0
+    except (IndexError, FileNotFoundError) as e:
+        print(f"[INFO] No existing checkpoint found: {e}")
+        start_epoch = 0
 
     if start_epoch > 0:
         print(f"[INFO] Resuming from epoch {start_epoch}, advancing lr_scheduler...")
         for _ in range(start_epoch * num_iters_per_epoch):
             lr_scheduler.step()
 
-    if "resume_checkpoint" in args:
+    if hasattr(args, "resume_checkpoint") and args.resume_checkpoint:
         start_epoch = checkpointer.restore_checkpoint(args.resume_checkpoint, best=False)
         print(f"Resume from checkpoint at epoch {start_epoch}")
 
