@@ -29,44 +29,17 @@ from dagr.model.networks.ema import ModelEMA
 
 def debug_data_format(data, targets=None):
     """调试数据和标签格式"""
-    print(f"\n[DATA DEBUG] ========== Data Format Debug ==========")
-    print(f"[DATA DEBUG] Data batch info:")
-    print(f"  - data.x.shape: {data.x.shape if hasattr(data, 'x') else 'No x'}")
-    print(f"  - data.pos.shape: {data.pos.shape if hasattr(data, 'pos') else 'No pos'}")
-    print(f"  - data.batch: {data.batch.shape if hasattr(data, 'batch') else 'No batch'}")
-    print(f"  - data.num_graphs: {data.num_graphs if hasattr(data, 'num_graphs') else 'No num_graphs'}")
+    print(f"\n[DATA INFO] Batch info: graphs={data.num_graphs}, features={data.x.shape}")
     
     if hasattr(data, 'bbox'):
-        print(f"  - data.bbox.shape: {data.bbox.shape}")
-        print(f"  - data.bbox_batch.shape: {data.bbox_batch.shape if hasattr(data, 'bbox_batch') else 'No bbox_batch'}")
-        
-        bbox_stats = {
-            'min': data.bbox.min(0)[0],
-            'max': data.bbox.max(0)[0],
-            'mean': data.bbox.mean(0),
-            'std': data.bbox.std(0)
-        }
-        print(f"  - BBox statistics:")
-        for k, v in bbox_stats.items():
-            print(f"    {k}: {v}")
-        
+        print(f"[DATA INFO] BBox shape: {data.bbox.shape}")
         non_zero_boxes = (data.bbox.sum(dim=1) != 0).sum().item()
-        print(f"  - Non-zero boxes: {non_zero_boxes} / {data.bbox.shape[0]}")
+        print(f"[DATA INFO] Valid boxes: {non_zero_boxes} / {data.bbox.shape[0]}")
         
-        print(f"  - Sample bboxes:")
-        for i in range(min(10, data.bbox.shape[0])):
-            print(f"    [{i}]: {data.bbox[i]}")
-    
-    if targets is not None:
-        print(f"[DATA DEBUG] Targets info:")
-        for i, target in enumerate(targets):
-            if target.numel() > 0:
-                print(f"  - Target {i}: shape={target.shape}")
-                print(f"    Sample: {target[0] if len(target) > 0 else 'empty'}")
-                non_zero = (target[:, 1:].sum(dim=1) != 0).sum().item()
-                print(f"    Non-zero: {non_zero} / {target.shape[0]}")
-    
-    print(f"[DATA DEBUG] =====================================\n")
+        if targets is not None:
+            print(f"[DATA INFO] Targets count: {len(targets)}")
+            valid_targets = sum(1 for t in targets if t.numel() > 0)
+            print(f"[DATA INFO] Valid targets: {valid_targets}")
 
 def gradients_broken(model):
     for name, param in model.named_parameters():
@@ -91,11 +64,16 @@ def train(loader: DataLoader,
     total_loss = 0.0
     num_batches = 0
     running_losses = {}
+    
+    # 添加epoch信息显示
+    epoch = getattr(args, "current_epoch", 0)
+    print(f"\n=== Training Epoch: {epoch+1}/{args.tot_num_epochs} ===")
 
     for i, data in enumerate(tqdm.tqdm(loader, desc=f"Training {run_name}")):
         data = data.cuda(non_blocking=True)
         data = format_data(data)
 
+        # 只在第一个迭代显示数据格式信息
         if i == 0:
             debug_data_format(data)
 
@@ -148,13 +126,13 @@ def train(loader: DataLoader,
             avg_losses = {k: sum(v[-50:]) / len(v[-50:]) for k, v in running_losses.items()}
             current_lr = scheduler.get_last_lr()[-1]
             
-            print(f"Iteration {i+1}/{len(loader)}:")
-            print(f"  Total Loss: {loss_value:.4f} (avg: {sum(running_losses.get('total', [loss_value])[-50:]) / min(50, len(running_losses.get('total', [loss_value]))):.4f})")
-            print(f"  Learning Rate: {current_lr:.6f}")
+            print(f"\n[TRAIN] Epoch {epoch+1}/{args.tot_num_epochs}, Iteration {i+1}/{len(loader)}:")
+            print(f"[TRAIN] Total Loss: {loss_value:.4f} (avg: {sum(running_losses.get('total', [loss_value])[-50:]) / min(50, len(running_losses.get('total', [loss_value]))):.4f})")
+            print(f"[TRAIN] Learning Rate: {current_lr:.6f}")
             
             for k, v in avg_losses.items():
                 clean_key = k.replace("_", " ").title()
-                print(f"  {clean_key}: {v:.4f}")
+                print(f"[TRAIN] {clean_key}: {v:.4f}")
             print("-" * 50)
 
         loss.backward()
@@ -203,7 +181,8 @@ def run_test(loader: DataLoader,
     model.eval()
     mapcalc = DetectionBuffer(height=loader.dataset.height, width=loader.dataset.width, classes=loader.dataset.classes)
 
-    for i, data in enumerate(tqdm.tqdm(loader)):
+    print(f"[EVAL] Running evaluation...")
+    for i, data in enumerate(tqdm.tqdm(loader, desc="Evaluation")):
         data = data.cuda()
         data = format_data(data)
         detections, targets = model(data)
@@ -286,8 +265,9 @@ if __name__ == '__main__':
 
     print("starting to train")
     for epoch in range(start_epoch, args.tot_num_epochs):
+        setattr(args, "current_epoch", epoch)
         avg_loss = train(train_loader, model, ema, lr_scheduler, optimizer, args, run_name=wandb.run.name)
-        print(f"Epoch {epoch}: Average Loss = {avg_loss:.4f}")
+        print(f"[TRAIN] Epoch {epoch+1}: Average Loss = {avg_loss:.4f}")
         checkpointer.checkpoint(epoch, name="last_model")
 
         if epoch % 3 > 0:
@@ -296,5 +276,5 @@ if __name__ == '__main__':
         with torch.no_grad():
             mapcalc = run_test(test_loader, ema.ema, dataset=args.dataset)
             metrics = mapcalc.compute()
-            print(f"mAP: {metrics.get('mAP', 'N/A')}")
+            print(f"[EVAL] Epoch {epoch+1}: mAP = {metrics.get('mAP', 'N/A')}")
             checkpointer.process(metrics, epoch)

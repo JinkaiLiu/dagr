@@ -86,8 +86,6 @@ class FCOSHead(nn.Module):
                 print(f"[WARNING] Empty tensor at feature level {i}")
                 continue
             
-            print(f"[DEBUG] Processing feature {i} with shape: {x.shape}")
-            
             try:
                 cls_feat = self.cls_convs[i](x)
                 reg_feat = self.reg_convs[i](x)
@@ -105,7 +103,6 @@ class FCOSHead(nn.Module):
                 
             except Exception as e:
                 print(f"[ERROR] Failed to process feature {i}: {e}")
-                print(f"[DEBUG] Feature shape: {x.shape}, expected channels: {self.cls_convs[i][0].in_channels}")
                 continue
 
         if len(cls_scores) == 0:
@@ -125,10 +122,7 @@ class FCOSHead(nn.Module):
     def loss(self, cls_scores, reg_preds, centernesses, targets):
         device = cls_scores[0].device
         
-        print(f"[DEBUG] Input shapes: cls={[s.shape for s in cls_scores]}")
-        
         min_batch_size = min(cls.shape[0] for cls in cls_scores)
-        print(f"[DEBUG] Min batch size across levels: {min_batch_size}")
         
         feature_info = []
         flat_cls_scores = []
@@ -142,8 +136,6 @@ class FCOSHead(nn.Module):
             
             B, C, H, W = cls.shape
             stride = self.strides[i] if i < len(self.strides) else 8
-            
-            print(f"[DEBUG] Level {i}: {B}x{C}x{H}x{W}, stride={stride}")
             
             cls_flat = cls.permute(0, 2, 3, 1).reshape(B, H*W, C)
             reg_flat = reg.permute(0, 2, 3, 1).reshape(B, H*W, 4)
@@ -163,18 +155,14 @@ class FCOSHead(nn.Module):
         num_pos_total = 0
 
         B = min_batch_size
-        print(f"[DEBUG] Processing batch size: {B}")
-        print(f"[DEBUG] Total points per batch: {all_cls_scores.shape[1]}")
 
         for batch_idx in range(B):
             if batch_idx >= len(targets):
-                print(f"[DEBUG] Batch {batch_idx}: No target available")
                 continue
                 
             gt = targets[batch_idx]
             
             if gt.numel() == 0:
-                print(f"[DEBUG] Batch {batch_idx}: No ground truth")
                 continue
                 
             gt_areas = gt[:, 3] * gt[:, 4]
@@ -185,19 +173,11 @@ class FCOSHead(nn.Module):
             
             gt_valid = gt[valid_mask]
             
-            print(f"[DEBUG] Batch {batch_idx}: Total GT: {gt.shape[0]}, Valid GT: {gt_valid.shape[0]}")
-            
             if gt_valid.numel() == 0:
-                print(f"[DEBUG] Batch {batch_idx}: No valid ground truth")
-                print(f"[DEBUG] Sample GT boxes: {gt[:3]}")
                 continue
 
             gt_cls = gt_valid[:, 0].long()
             gt_boxes = gt_valid[:, 1:]
-            
-            print(f"[DEBUG] Batch {batch_idx}: Valid GT boxes: {gt_boxes.shape[0]}")
-            print(f"[DEBUG] Batch {batch_idx}: GT box coords range: x[{gt_boxes[:, 0].min():.1f}, {gt_boxes[:, 0].max():.1f}] y[{gt_boxes[:, 1].min():.1f}, {gt_boxes[:, 1].max():.1f}]")
-            print(f"[DEBUG] Batch {batch_idx}: GT box sizes: w={gt_boxes[:, 2].mean():.1f}, h={gt_boxes[:, 3].mean():.1f}")
 
             points = []
             strides_all = []
@@ -208,22 +188,12 @@ class FCOSHead(nn.Module):
                 p = torch.stack([x, y], dim=1).to(device)
                 points.append(p)
                 strides_all.append(torch.full((len(p),), stride, device=device))
-                
-                print(f"[DEBUG] Level {level_idx}: Feature map {H}x{W}, stride {stride}")
-                print(f"[DEBUG] Level {level_idx}: Points range x[{x.min():.1f}, {x.max():.1f}] y[{y.min():.1f}, {y.max():.1f}]")
-                
-                gt_center_x = gt_boxes[:, 0]
-                gt_center_y = gt_boxes[:, 1]
-                print(f"[DEBUG] Level {level_idx}: GT centers x[{gt_center_x.min():.1f}, {gt_center_x.max():.1f}] y[{gt_center_y.min():.1f}, {gt_center_y.max():.1f}]")
             
             if len(points) == 0:
-                print(f"[DEBUG] Batch {batch_idx}: No feature points generated")
                 continue
                 
             points = torch.cat(points, dim=0)
             strides_all = torch.cat(strides_all, dim=0)
-            
-            print(f"[DEBUG] Batch {batch_idx}: Total feature points: {points.shape[0]}")
 
             num_points = points.shape[0]
             num_gts = gt_boxes.shape[0]
@@ -233,8 +203,6 @@ class FCOSHead(nn.Module):
             x1y1 = gt_xy - gt_wh / 2
             x2y2 = gt_xy + gt_wh / 2
             gt_area = (x2y2[:, 0] - x1y1[:, 0]) * (x2y2[:, 1] - x1y1[:, 1])
-
-            print(f"[DEBUG] Batch {batch_idx}: GT boxes in xyxy format: x1y1={x1y1.min(0)[0]} to x2y2={x2y2.max(0)[0]}")
 
             px = points[:, 0].unsqueeze(1)
             py = points[:, 1].unsqueeze(1)
@@ -255,39 +223,8 @@ class FCOSHead(nn.Module):
             
             is_pos = inside_box & center_dist
             
-            print(f"[DEBUG] Batch {batch_idx}: Points inside boxes: {inside_box.sum().item()}")
-            print(f"[DEBUG] Batch {batch_idx}: Points in center regions (radius_factor={radius_factor}): {center_dist.sum().item()}")
-            print(f"[DEBUG] Batch {batch_idx}: Final positive points: {is_pos.sum().item()}")
-            
-            if inside_box.sum().item() == 0:
-                print(f"[DEBUG] Batch {batch_idx}: Debugging point-box overlap...")
-                for gt_idx in range(num_gts):
-                    gt_box = gt_boxes[gt_idx]
-                    print(f"[DEBUG]   GT {gt_idx}: center=({gt_box[0]:.1f}, {gt_box[1]:.1f}), size=({gt_box[2]:.1f}, {gt_box[3]:.1f})")
-                    gt_x1y1 = gt_xy[gt_idx] - gt_wh[gt_idx] / 2
-                    gt_x2y2 = gt_xy[gt_idx] + gt_wh[gt_idx] / 2
-                    print(f"[DEBUG]   GT {gt_idx}: xyxy=({gt_x1y1[0]:.1f}, {gt_x1y1[1]:.1f}, {gt_x2y2[0]:.1f}, {gt_x2y2[1]:.1f})")
-                    
-                    closest_points_idx = torch.argmin(
-                        torch.sqrt((px.squeeze() - gt_xy[gt_idx, 0])**2 + (py.squeeze() - gt_xy[gt_idx, 1])**2)
-                    )
-                    closest_point = points[closest_points_idx]
-                    closest_stride = strides_all[closest_points_idx]
-                    print(f"[DEBUG]   Closest point to GT {gt_idx}: ({closest_point[0]:.1f}, {closest_point[1]:.1f}), stride={closest_stride:.0f}")
-                    
-                    distances_to_center = torch.sqrt((px.squeeze() - gt_xy[gt_idx, 0])**2 + (py.squeeze() - gt_xy[gt_idx, 1])**2)
-                    within_1_stride = distances_to_center < strides_all
-                    within_2_stride = distances_to_center < (strides_all * 2)
-                    print(f"[DEBUG]   Points within 1*stride: {within_1_stride.sum().item()}, within 2*stride: {within_2_stride.sum().item()}")
-
             if is_pos.sum().item() == 0:
-                print(f"[DEBUG] Batch {batch_idx}: Trying more relaxed assignment...")
-                
-                relaxed_radius = strides_all.unsqueeze(1) * 2.5
-                relaxed_center_dist = (center_x < relaxed_radius) & (center_y < relaxed_radius)
-                is_pos = inside_box | relaxed_center_dist
-                
-                print(f"[DEBUG] Batch {batch_idx}: Relaxed positive points: {is_pos.sum().item()}")
+                is_pos = inside_box | center_dist
 
             gt_area_expanded = gt_area.unsqueeze(0).repeat(num_points, 1)
             gt_area_expanded[~is_pos] = float('inf')
@@ -295,10 +232,7 @@ class FCOSHead(nn.Module):
             pos_mask = min_area < float('inf')
             num_pos = pos_mask.sum().item()
             
-            print(f"[DEBUG] Batch {batch_idx}: Final assigned positive samples: {num_pos}")
-            
             if num_pos == 0:
-                print(f"[DEBUG] Batch {batch_idx}: NO POSITIVE SAMPLES FOUND!")
                 continue
 
             matched_inds = min_inds[pos_mask]
@@ -322,15 +256,40 @@ class FCOSHead(nn.Module):
 
             left_right = reg_target[:, [0, 2]]
             top_bottom = reg_target[:, [1, 3]]
-            centerness = (left_right.min(dim=1)[0] / left_right.max(dim=1)[0]) * \
-                         (top_bottom.min(dim=1)[0] / top_bottom.max(dim=1)[0])
-            centerness = torch.sqrt(centerness).clamp(0, 1).detach()
-
-            pred_ctr = all_centernesses[batch_idx][pos_mask].squeeze(-1)
             
-            if pred_ctr.numel() > 0 and centerness.numel() > 0:
-                loss_ctr = F.binary_cross_entropy_with_logits(pred_ctr, centerness, reduction='mean')
+            # 添加epsilon防止除零
+            epsilon = 1e-6
+            
+            # 检查并过滤无效值
+            valid_mask = (left_right.max(dim=1)[0] > epsilon) & (top_bottom.max(dim=1)[0] > epsilon)
+            
+            if valid_mask.sum() > 0:
+                # 只对有效样本计算centerness
+                left_right_valid = left_right[valid_mask]
+                top_bottom_valid = top_bottom[valid_mask]
+                
+                centerness_valid = (left_right_valid.min(dim=1)[0] / (left_right_valid.max(dim=1)[0] + epsilon)) * \
+                               (top_bottom_valid.min(dim=1)[0] / (top_bottom_valid.max(dim=1)[0] + epsilon))
+                centerness_valid = torch.sqrt(centerness_valid).clamp(0, 1).detach()
+                
+                # 创建完整的centerness张量，对无效位置填充0.5（表示中性）
+                centerness = torch.ones_like(left_right[:, 0]) * 0.5
+                centerness[valid_mask] = centerness_valid
+                
+                pred_ctr = all_centernesses[batch_idx][pos_mask].squeeze(-1)
+                
+                if pred_ctr.numel() > 0:
+                    # 只对有效位置计算loss
+                    pred_ctr_valid = pred_ctr[valid_mask]
+                    if pred_ctr_valid.numel() > 0:
+                        loss_ctr = F.binary_cross_entropy_with_logits(pred_ctr_valid, centerness_valid, reduction='mean')
+                    else:
+                        loss_ctr = torch.tensor(0.0, device=device)
+                else:
+                    loss_ctr = torch.tensor(0.0, device=device)
             else:
+                # 所有样本都无效，返回零loss
+                centerness = torch.ones_like(left_right[:, 0]) * 0.5
                 loss_ctr = torch.tensor(0.0, device=device)
 
             losses['loss_cls'] += loss_cls
@@ -338,7 +297,8 @@ class FCOSHead(nn.Module):
             losses['loss_ctr'] += loss_ctr
             num_pos_total += num_pos
 
-        print(f"[DEBUG] Total positive samples across batch: {num_pos_total}")
+        if num_pos_total > 0:
+            print(f"[TRAIN] Found {num_pos_total} positive samples across batch")
         
         for k in losses:
             losses[k] = losses[k] / max(B, 1)
@@ -346,9 +306,6 @@ class FCOSHead(nn.Module):
         return losses
 
     def decode_outputs(self, cls_scores, reg_preds, centernesses):
-        print(f"[DEBUG] decode_outputs called with cls_scores type: {type(cls_scores)}")
-        print(f"[DEBUG] cls_scores length: {len(cls_scores) if isinstance(cls_scores, (list, tuple)) else 'not list/tuple'}")
-        
         if len(cls_scores) == 0:
             device = next(self.parameters()).device
             return torch.zeros(1, 1, 5 + self.num_classes, device=device)
@@ -358,16 +315,8 @@ class FCOSHead(nn.Module):
         reg_preds_copy = [reg.clone() for reg in reg_preds]  
         centernesses_copy = [ctr.clone() for ctr in centernesses]
         
-        for i, scores in enumerate(cls_scores_copy):
-            print(f"[DEBUG] cls_scores_copy[{i}] type: {type(scores)}, shape: {scores.shape if hasattr(scores, 'shape') else 'no shape'}")
-        for i, regs in enumerate(reg_preds_copy):
-            print(f"[DEBUG] reg_preds_copy[{i}] type: {type(regs)}, shape: {regs.shape if hasattr(regs, 'shape') else 'no shape'}")
-        for i, ctrs in enumerate(centernesses_copy):
-            print(f"[DEBUG] centernesses_copy[{i}] type: {type(ctrs)}, shape: {ctrs.shape if hasattr(ctrs, 'shape') else 'no shape'}")
-        
         try:
             min_batch_size = min(cls.shape[0] for cls in cls_scores_copy if hasattr(cls, 'shape') and cls.shape[0] > 0)
-            print(f"[DEBUG] Decode - Min batch size: {min_batch_size}")
         except Exception as e:
             print(f"[ERROR] Failed to compute min batch size: {e}")
             device = next(self.parameters()).device
@@ -377,48 +326,30 @@ class FCOSHead(nn.Module):
         outputs = []
 
         for batch_idx in range(B):
-            print(f"[DEBUG] Processing batch {batch_idx}/{B}")
             boxes_all, scores_all, labels_all = [], [], []
             detection_count = 0
 
             for level_idx in range(len(cls_scores_copy)):
                 try:
                     if level_idx >= len(self.strides):
-                        print(f"[DEBUG] Skipping level {level_idx}, no stride available")
                         break
                     
                     cls = cls_scores_copy[level_idx]
                     reg = reg_preds_copy[level_idx] 
                     ctr = centernesses_copy[level_idx]
                     
-                    print(f"[DEBUG] Level {level_idx}: Processing tensors with shapes cls={cls.shape}, reg={reg.shape}, ctr={ctr.shape}")
-                    
-                    if not isinstance(cls, torch.Tensor):
-                        print(f"[ERROR] cls at level {level_idx} is not tensor: {type(cls)}")
-                        continue
-                    if not isinstance(reg, torch.Tensor):
-                        print(f"[ERROR] reg at level {level_idx} is not tensor: {type(reg)}")
-                        continue
-                    if not isinstance(ctr, torch.Tensor):
-                        print(f"[ERROR] ctr at level {level_idx} is not tensor: {type(ctr)}")
+                    if not isinstance(cls, torch.Tensor) or not isinstance(reg, torch.Tensor) or not isinstance(ctr, torch.Tensor):
                         continue
                     
                     if len(cls.shape) < 1 or len(reg.shape) < 1 or len(ctr.shape) < 1:
-                        print(f"[ERROR] Invalid tensor dimensions at level {level_idx}")
                         continue
                         
                     if batch_idx >= cls.shape[0] or batch_idx >= reg.shape[0] or batch_idx >= ctr.shape[0]:
-                        print(f"[WARNING] Batch index {batch_idx} exceeds tensor size at level {level_idx}: cls={cls.shape[0]}, reg={reg.shape[0]}, ctr={ctr.shape[0]}")
                         break
                 except Exception as e:
-                    print(f"[ERROR] Exception during tensor validation at level {level_idx}: {e}")
-                    import traceback
-                    traceback.print_exc()
                     continue
                     
                 try:
-                    print(f"[DEBUG] Level {level_idx}, Batch {batch_idx}: cls.shape={cls.shape}, reg.shape={reg.shape}, ctr.shape={ctr.shape}")
-                    
                     cls_batch = torch.sigmoid(cls[batch_idx])
                     reg_batch = reg[batch_idx]
                     ctr_batch = torch.sigmoid(ctr[batch_idx])
@@ -432,21 +363,16 @@ class FCOSHead(nn.Module):
                         if sqrt_size * sqrt_size == ctr_batch.shape[0]:
                             ctr_batch = ctr_batch.view(sqrt_size, sqrt_size)
                         else:
-                            print(f"[WARNING] Cannot reshape centerness {ctr_batch.shape} to 2D at level {level_idx}, batch {batch_idx}")
                             continue
 
                     if cls_batch.numel() == 0 or reg_batch.numel() == 0 or ctr_batch.numel() == 0:
-                        print(f"[WARNING] Empty tensors at level {level_idx}, batch {batch_idx}")
                         continue
 
                     C, H, W = cls_batch.shape
                     stride = self.strides[level_idx]
 
                     if H <= 0 or W <= 0:
-                        print(f"[WARNING] Invalid spatial dimensions: H={H}, W={W} at level {level_idx}")
                         continue
-
-                    print(f"[DEBUG] Level {level_idx}, Batch {batch_idx}: Processing {C}x{H}x{W} with stride {stride}")
 
                     grid_y, grid_x = torch.meshgrid(torch.arange(H), torch.arange(W), indexing='ij')
                     grid_x = grid_x.to(cls_batch.device).float() * stride + stride // 2
@@ -467,15 +393,12 @@ class FCOSHead(nn.Module):
                     ctr_reshaped = ctr_batch.reshape(-1, 1)
                     scores = torch.sqrt(torch.clamp(cls_reshaped * ctr_reshaped, min=0))
 
-                    print(f"[DEBUG] Level {level_idx}, Batch {batch_idx}: Score stats - min={scores.min().item():.4f}, max={scores.max().item():.4f}, mean={scores.mean().item():.4f}")
-
                     max_scores, labels = scores.max(dim=1)
                     
                     score_threshold = 0.01
                     mask = max_scores > score_threshold
                     
                     valid_detections = mask.sum().item()
-                    print(f"[DEBUG] Level {level_idx}, Batch {batch_idx}: Valid detections above {score_threshold}: {valid_detections}")
                     
                     if mask.sum() == 0:
                         k = min(10, len(max_scores))
@@ -483,7 +406,6 @@ class FCOSHead(nn.Module):
                             topk_scores, topk_indices = torch.topk(max_scores, k)
                             mask = torch.zeros_like(max_scores, dtype=torch.bool)
                             mask[topk_indices] = True
-                            print(f"[DEBUG] Level {level_idx}, Batch {batch_idx}: Using top-{k} detections, min_score={topk_scores.min().item():.4f}")
 
                     if mask.sum() == 0:
                         continue
@@ -515,20 +437,13 @@ class FCOSHead(nn.Module):
                             labels_all.append(torch.full_like(cls_scores[keep], class_id))
 
                 except Exception as e:
-                    print(f"[ERROR] Error in decode at level {level_idx}, batch {batch_idx}: {e}")
-                    import traceback
-                    traceback.print_exc()
                     continue
-
-            print(f"[DEBUG] Batch {batch_idx}: Total detections before NMS: {detection_count}")
 
             if boxes_all:
                 try:
                     boxes_all = torch.cat(boxes_all)
                     scores_all = torch.cat(scores_all)
                     labels_all = torch.cat(labels_all)
-
-                    print(f"[DEBUG] Batch {batch_idx}: Final detections after NMS: {len(boxes_all)}")
 
                     xywh = torch.zeros_like(boxes_all)
                     xywh[:, 0] = (boxes_all[:, 0] + boxes_all[:, 2]) / 2
@@ -544,18 +459,13 @@ class FCOSHead(nn.Module):
                     onehot[indices, labels_long] = 1.0
 
                     output = torch.cat([xywh, scores_all.unsqueeze(1), onehot], dim=1)
-                    
-                    print(f"[DEBUG] Batch {batch_idx}: Output tensor shape: {output.shape}")
-                    print(f"[DEBUG] Batch {batch_idx}: Score range: {scores_all.min().item():.4f} to {scores_all.max().item():.4f}")
                 
                 except Exception as e:
-                    print(f"[ERROR] Failed to concatenate results for batch {batch_idx}: {e}")
                     device = cls_scores[0].device
                     fake_detection = torch.zeros(1, 5 + self.num_classes, device=device)
                     fake_detection[0, 4] = 0.001
                     output = fake_detection
             else:
-                print(f"[DEBUG] Batch {batch_idx}: No detections, creating fake output")
                 device = cls_scores[0].device
                 fake_detection = torch.zeros(1, 5 + self.num_classes, device=device)
                 fake_detection[0, 4] = 0.001
@@ -565,7 +475,6 @@ class FCOSHead(nn.Module):
 
         if len(outputs) == 0:
             device = next(self.parameters()).device
-            print(f"[WARNING] No outputs generated, creating default output")
             return torch.zeros(1, 1, 5 + self.num_classes, device=device)
             
         try:
@@ -579,11 +488,8 @@ class FCOSHead(nn.Module):
                 padded_outputs.append(output)
                 
             result = torch.stack(padded_outputs, dim=0)
-            print(f"[DEBUG] Final stacked output shape: {result.shape}")
             return result
             
         except Exception as e:
-            print(f"[ERROR] Failed to stack outputs: {e}")
-            print(f"[DEBUG] Output shapes: {[o.shape for o in outputs]}")
             device = next(self.parameters()).device
             return torch.zeros(min_batch_size, 1, 5 + self.num_classes, device=device)
