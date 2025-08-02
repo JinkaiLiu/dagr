@@ -2,13 +2,6 @@ import os
 import math
 import datetime
 import numpy as np
-from matplotlib import pyplot as plt
-from matplotlib.lines import Line2D
-
-os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
-os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
-os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -18,7 +11,21 @@ import wandb
 from pathlib import Path
 import argparse
 import random
-import numpy as np
+import cv2
+import os.path as osp
+
+# 导入辅助函数
+from dagr.model.networks.utils import (
+    box_iou, xywh_to_xyxy, xyxy_to_xywh,
+    visualize_detections, analyze_precision_recall,
+    analyze_confidence_distribution, debug_gradient_flow,
+    inspect_model_stats, debug_data_format, gradients_broken,
+    fix_gradients, mAPCalculator
+)
+
+os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
+os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
 from torch_geometric.data import DataLoader
 
@@ -31,127 +38,16 @@ from dagr.data.dsec_data import DSEC
 from dagr.model.networks.dagr_fcos import DAGR
 from dagr.model.networks.ema import ModelEMA
 
-def debug_data_format(data, targets=None):
-    """调试数据和标签格式"""
-    print(f"\n[DATA INFO] Batch info: graphs={data.num_graphs}, features={data.x.shape}")
-    
-    if hasattr(data, 'bbox'):
-        print(f"[DATA INFO] BBox shape: {data.bbox.shape}")
-        non_zero_boxes = (data.bbox.sum(dim=1) != 0).sum().item()
-        print(f"[DATA INFO] Valid boxes: {non_zero_boxes} / {data.bbox.shape[0]}")
-        
-        if targets is not None:
-            print(f"[DATA INFO] Targets count: {len(targets)}")
-            valid_targets = sum(1 for t in targets if t.numel() > 0)
-            print(f"[DATA INFO] Valid targets: {valid_targets}")
-
-def gradients_broken(model):
-    for name, param in model.named_parameters():
-        if param.grad is not None and torch.isnan(param.grad).any():
-            return True
-    return False
-
-def fix_gradients(model):
-    for name, param in model.named_parameters():
-        if param.grad is not None:
-            param.grad.data = torch.nan_to_num(param.grad.data, nan=0.0)
-
-def debug_gradient_flow(named_parameters):
-    """
-    可视化梯度流动情况，帮助调试
-    """
-    ave_grads = []
-    max_grads= []
-    layers = []
-    for n, p in named_parameters:
-        if(p.requires_grad) and ("bias" not in n):
-            if p.grad is not None:
-                layers.append(n)
-                ave_grads.append(p.grad.abs().mean().item())
-                max_grads.append(p.grad.abs().max().item())
-            else:
-                print(f"Parameter {n} has no gradient")
-    
-    if not ave_grads:
-        print("No gradients to analyze")
+def log_box_statistics(boxes):
+    """记录边界框统计信息"""
+    if len(boxes) == 0:
         return
-        
-    plt.figure(figsize=(10, 7))
-    plt.bar(np.arange(len(max_grads)), max_grads, alpha=0.1, lw=1, color="c")
-    plt.bar(np.arange(len(max_grads)), ave_grads, alpha=0.1, lw=1, color="b")
-    plt.hlines(0, 0, len(ave_grads)+1, lw=2, color="k" )
-    plt.xticks(range(0, len(ave_grads), 1), layers, rotation="vertical")
-    plt.xlim(left=0, right=len(ave_grads))
-    plt.ylim(bottom=-0.001, top=0.02)
-    plt.xlabel("Layers")
-    plt.ylabel("average gradient")
-    plt.title("Gradient flow")
-    plt.grid(True)
-    plt.legend([Line2D([0], [0], color="c", lw=4),
-                Line2D([0], [0], color="b", lw=4),
-                Line2D([0], [0], color="k", lw=4)], ['max-gradient', 'mean-gradient', 'zero-gradient'])
     
-    # 保存图表
-    plt.tight_layout()
-    plt.savefig('gradient_flow.png')
-    plt.close()
-    print("Gradient flow visualization saved to gradient_flow.png")
-
-def inspect_model_stats(model, prefix=''):
-    """
-    检查模型的权重统计信息，帮助识别问题
-    """
-    stats = {}
+    widths = boxes[:, 2]
+    heights = boxes[:, 3]
     
-    for name, param in model.named_parameters():
-        full_name = f"{prefix}.{name}" if prefix else name
-        
-        if param.requires_grad:
-            stats[full_name] = {
-                'shape': list(param.shape),
-                'mean': float(param.data.mean().item()),
-                'std': float(param.data.std().item()),
-                'min': float(param.data.min().item()),
-                'max': float(param.data.max().item()),
-                'has_nan': bool(torch.isnan(param.data).any().item()),
-                'has_inf': bool(torch.isinf(param.data).any().item()),
-            }
-            
-            if param.grad is not None:
-                stats[full_name].update({
-                    'grad_mean': float(param.grad.mean().item()),
-                    'grad_std': float(param.grad.std().item()),
-                    'grad_min': float(param.grad.min().item()),
-                    'grad_max': float(param.grad.max().item()),
-                    'grad_has_nan': bool(torch.isnan(param.grad).any().item()),
-                    'grad_has_inf': bool(torch.isinf(param.grad).any().item()),
-                })
-            else:
-                stats[full_name].update({
-                    'grad': None
-                })
-    
-    # 找出可能有问题的层
-    problematic_layers = []
-    for name, layer_stats in stats.items():
-        if layer_stats.get('has_nan', False) or layer_stats.get('has_inf', False):
-            problematic_layers.append((name, 'weights contain NaN/Inf'))
-        elif layer_stats.get('grad_has_nan', False) or layer_stats.get('grad_has_inf', False):
-            problematic_layers.append((name, 'gradients contain NaN/Inf'))
-        elif abs(layer_stats.get('mean', 0)) > 100 or layer_stats.get('std', 0) > 100:
-            problematic_layers.append((name, 'unusual weight statistics'))
-    
-    # 打印问题层
-    if problematic_layers:
-        print(f"[WARNING] Found {len(problematic_layers)} problematic layers:")
-        for name, issue in problematic_layers:
-            print(f"  - {name}: {issue}")
-            layer_stats = stats[name]
-            print(f"    Stats: mean={layer_stats['mean']:.4f}, std={layer_stats['std']:.4f}, min={layer_stats['min']:.4f}, max={layer_stats['max']:.4f}")
-            if 'grad_mean' in layer_stats:
-                print(f"    Grad stats: mean={layer_stats['grad_mean']:.4f}, std={layer_stats['grad_std']:.4f}, min={layer_stats['grad_min']:.4f}, max={layer_stats['grad_max']:.4f}")
-    
-    return stats, problematic_layers
+    print(f"Box width stats: min={widths.min().item():.6f}, max={widths.max().item():.6f}, mean={widths.mean().item():.6f}")
+    print(f"Box height stats: min={heights.min().item():.6f}, max={heights.max().item():.6f}, mean={heights.mean().item():.6f}")
 
 def train(loader: DataLoader,
           model: torch.nn.Module,
@@ -184,15 +80,13 @@ def train(loader: DataLoader,
 
         loss_dict = {k: v for k, v in model_outputs.items() if "loss" in k}
         
-        # 检查和处理NaN损失
+        # 检查和处理NaN损失 - 减少打印频率
         for k, v in loss_dict.items():
             if isinstance(v, dict):
                 for sub_k, sub_v in v.items():
                     if torch.is_tensor(sub_v) and torch.isnan(sub_v).any():
-                        print(f"[WARNING] NaN detected in {k}.{sub_k}, replacing with zero")
                         v[sub_k] = torch.zeros_like(sub_v)
             elif torch.is_tensor(v) and torch.isnan(v).any():
-                print(f"[WARNING] NaN detected in {k}, replacing with zero")
                 loss_dict[k] = torch.zeros_like(v)
         
         lambda_cnn = getattr(args, "lambda_cnn_loss", 1.0)
@@ -226,12 +120,10 @@ def train(loader: DataLoader,
         else:
             loss_cnn = torch.tensor(float(loss_cnn), device=device, requires_grad=True)
         
-        # 处理NaN损失
+        # 处理NaN损失 - 减少打印频率
         if torch.isnan(loss_fusion).any():
-            print(f"[WARNING] loss_fusion is NaN, replacing with zero")
             loss_fusion = torch.tensor(0.0, device=device, requires_grad=True)
         if torch.isnan(loss_cnn).any():
-            print(f"[WARNING] loss_cnn is NaN, replacing with zero")
             loss_cnn = torch.tensor(0.0, device=device, requires_grad=True)
             
         # 计算最终损失，确保能够反向传播
@@ -243,7 +135,6 @@ def train(loader: DataLoader,
             
             # 检查loss是否需要梯度
             if not loss.requires_grad:
-                print("[WARNING] Final loss does not require gradients, creating a dummy loss")
                 # 创建一个能反向传播的损失
                 loss = loss * dummy_param.sum() * 0.0 + loss.detach()
                 
@@ -251,14 +142,12 @@ def train(loader: DataLoader,
             if loss.item() == 0:
                 loss = loss + dummy_param.sum() * 0.0001
         except Exception as e:
-            print(f"[ERROR] Error computing final loss: {e}")
             # 从模型中获取一个参数以创建一个可以反向传播的损失
             dummy_param = next(model.parameters())
             loss = dummy_param.sum() * 0.0 + torch.tensor(0.01, device=device, requires_grad=True)
         
-        # 最后检查总损失
+        # 最后检查总损失 - 减少打印频率
         if torch.isnan(loss).any():
-            print(f"[WARNING] Total loss is NaN, using alternative calculation")
             # 计算非NaN的组件损失和
             valid_losses = []
             for k, v in loss_dict.items():
@@ -269,7 +158,6 @@ def train(loader: DataLoader,
                 dummy_param = next(model.parameters())
                 loss = sum(valid_losses) + dummy_param.sum() * 0.0
             else:
-                print(f"[WARNING] No valid component losses, using dummy loss")
                 dummy_param = next(model.parameters())
                 loss = dummy_param.sum() * 0.0 + torch.tensor(0.01, device=device, requires_grad=True)
 
@@ -293,47 +181,60 @@ def train(loader: DataLoader,
                 running_losses[k] = []
             running_losses[k].append(v_value)
 
-        if (i + 1) % 50 == 0:
-            avg_losses = {k: sum(v[-50:]) / len(v[-50:]) for k, v in running_losses.items()}
-            current_lr = scheduler.get_last_lr()[-1]
-            
-            print(f"\n[TRAIN] Epoch {epoch+1}/{args.tot_num_epochs}, Iteration {i+1}/{len(loader)}:")
-            print(f"[TRAIN] Total Loss: {loss_value:.4f} (avg: {sum(running_losses.get('total', [loss_value])[-50:]) / min(50, len(running_losses.get('total', [loss_value]))):.4f})")
-            print(f"[TRAIN] Learning Rate: {current_lr:.6f}")
-            
-            for k, v in avg_losses.items():
-                clean_key = k.replace("_", " ").title()
-                # 检查是否为NaN
-                if np.isnan(v):
-                    print(f"[TRAIN] {clean_key}: NaN (Warning: NaN detected)")
-                else:
-                    print(f"[TRAIN] {clean_key}: {v:.4f}")
-            print("-" * 50)
-            
-            # 定期检查模型权重是否存在NaN
-            nan_params = []
-            for name, param in model.named_parameters():
-                if torch.isnan(param.data).any():
-                    nan_params.append(name)
-            
-            if nan_params:
-                print(f"[WARNING] NaN detected in {len(nan_params)} parameters: {nan_params[:3]}...")
+        # 每200次迭代打印一次平均损失
+        if (i + 1) % 200 == 0:
+            # 计算过去200次迭代的平均损失
+            window_size = min(200, len(running_losses.get('fusion_total_loss', [])))
+            if window_size > 0:
+                avg_losses = {}
+                for k, v in running_losses.items():
+                    if len(v) >= window_size:
+                        avg_losses[k] = sum(v[-window_size:]) / window_size
+                
+                current_lr = scheduler.get_last_lr()[-1]
+                
+                print(f"\n[TRAIN] Epoch {epoch+1}/{args.tot_num_epochs}, Iteration {i+1}/{len(loader)}:")
+                print(f"[TRAIN] Total Loss: {loss_value:.6f}")
+                print(f"[TRAIN] Learning Rate: {current_lr:.6f}")
+                
+                # 单独打印主要损失组件
+                cls_loss = avg_losses.get('fusion_loss_cls', 0.0)
+                reg_loss = avg_losses.get('fusion_loss_reg', 0.0)
+                ctr_loss = avg_losses.get('fusion_loss_ctr', 0.0)
+                
+                print(f"[TRAIN] Classification Loss: {cls_loss:.6f}")
+                print(f"[TRAIN] Regression Loss: {reg_loss:.6f}")
+                print(f"[TRAIN] Centerness Loss: {ctr_loss:.6f}")
+                
+                # 打印损失组件比例
+                if loss_value > 0:
+                    total_component = cls_loss + reg_loss + ctr_loss
+                    if total_component > 0:
+                        cls_ratio = cls_loss / total_component * 100
+                        reg_ratio = reg_loss / total_component * 100
+                        ctr_ratio = ctr_loss / total_component * 100
+                        print(f"[TRAIN] Loss Ratios: Cls={cls_ratio:.2f}%, Reg={reg_ratio:.2f}%, Ctr={ctr_ratio:.2f}%")
+                
+                # 检查centerness和分类分支的输出分布
+                if hasattr(model, 'head') and hasattr(model.head, '_analyze_activation_stats'):
+                    stats = model.head._analyze_activation_stats()
+                    if stats:
+                        print(f"[TRAIN] Activation Stats: {stats}")
+                
+                print("-" * 60)
 
-        # 在反向传播前检查损失是否有梯度
+        # 在反向传播前检查损失是否有梯度 - 减少打印频率
         if not loss.requires_grad:
-            print("[WARNING] Loss does not require gradients before backward pass!")
             dummy_param = next(model.parameters())
             loss = dummy_param.sum() * 0.0 + torch.tensor(0.01, device=device, requires_grad=True)
             
         try:
             loss.backward()
         except RuntimeError as e:
-            print(f"[ERROR] Backward pass failed: {e}")
             # 获取模型参数，创建一个伪损失
             dummy_param = next(model.parameters())
             dummy_loss = dummy_param.sum() * 0.0001
             dummy_loss.backward()
-            print("[WARNING] Used dummy loss for backward pass")
             
         torch.nn.utils.clip_grad_value_(model.parameters(), args.clip)
         fix_gradients(model)
@@ -368,6 +269,26 @@ def train(loader: DataLoader,
                 
             training_logs[f"training/loss/{clean_key}"] = v_value
             
+        # 额外记录分类、回归和centerness损失比例
+        total_component = 0
+        for component in ['fusion_loss_cls', 'fusion_loss_reg', 'fusion_loss_ctr']:
+            if component in loss_dict:
+                value = loss_dict[component]
+                if torch.is_tensor(value):
+                    total_component += value.item()
+                else:
+                    total_component += float(value)
+                    
+        if total_component > 0:
+            for component in ['fusion_loss_cls', 'fusion_loss_reg', 'fusion_loss_ctr']:
+                if component in loss_dict:
+                    value = loss_dict[component]
+                    if torch.is_tensor(value):
+                        ratio = value.item() / total_component
+                    else:
+                        ratio = float(value) / total_component
+                    training_logs[f"training/loss_ratio/{component}"] = ratio
+        
         wandb.log({
             "training/loss": loss_value,
             "training/lr": scheduler.get_last_lr()[-1],
@@ -376,50 +297,6 @@ def train(loader: DataLoader,
 
     avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
     return avg_loss
-
-def log_box_statistics(boxes):
-    """记录边界框统计信息"""
-    if len(boxes) == 0:
-        return
-    
-    widths = boxes[:, 2]
-    heights = boxes[:, 3]
-    
-    print(f"Box width stats: min={widths.min().item():.6f}, max={widths.max().item():.6f}, mean={widths.mean().item():.6f}")
-    print(f"Box height stats: min={heights.min().item():.6f}, max={heights.max().item():.6f}, mean={heights.mean().item():.6f}")
-
-def run_test(loader: DataLoader,
-             model: torch.nn.Module,
-             dry_run_steps: int = -1,
-             dataset="gen1"):
-
-    model.eval()
-    mapcalc = DetectionBuffer(height=loader.dataset.height, width=loader.dataset.width, classes=loader.dataset.classes)
-
-    print(f"[EVAL] Running evaluation...")
-    total_detections = 0
-    
-    for i, data in enumerate(tqdm.tqdm(loader, desc="Evaluation")):
-        data = data.cuda()
-        data = format_data(data)
-        detections, targets = model(data)
-        
-        # 记录检测数量
-        if isinstance(detections, list):
-            batch_detections = sum(1 for d in detections if isinstance(d, dict) and len(d.get('boxes', [])) > 0)
-            total_detections += batch_detections
-        
-        if i % 10 == 0:
-            torch.cuda.empty_cache()
-        
-        mapcalc.update(detections, targets, dataset, data.height[0], data.width[0])
-        
-        if dry_run_steps > 0 and i == dry_run_steps:
-            break
-
-    print(f"[EVAL] Total detections across all batches: {total_detections}")
-    torch.cuda.empty_cache()
-    return mapcalc
 
 def compute_detailed_metrics(mapcalc):
     """计算并显示更详细的评估指标，包括更多小数位的mAP"""
@@ -448,7 +325,216 @@ def compute_detailed_metrics(mapcalc):
         recall = metrics['recall']
         print(f"[EVAL DETAILED] Precision = {precision:.8f}, Recall = {recall:.8f}")
     
+    # 提取并分析检测框统计信息
+    if hasattr(mapcalc, 'all_detections'):
+        all_boxes = []
+        for dets in mapcalc.all_detections:
+            if isinstance(dets, list) and dets:
+                for det in dets:
+                    if isinstance(det, dict) and 'boxes' in det:
+                        all_boxes.append(det['boxes'])
+        
+        if all_boxes:
+            all_boxes = torch.cat(all_boxes, dim=0)
+            if all_boxes.shape[1] == 4:  # XYXY格式
+                widths = all_boxes[:, 2] - all_boxes[:, 0]
+                heights = all_boxes[:, 3] - all_boxes[:, 1]
+            else:  # XYWH格式
+                widths = all_boxes[:, 2]
+                heights = all_boxes[:, 3]
+                
+            print(f"[EVAL DETAILED] Detection width: min={widths.min().item():.6f}, max={widths.max().item():.6f}, mean={widths.mean().item():.6f}")
+            print(f"[EVAL DETAILED] Detection height: min={heights.min().item():.6f}, max={heights.max().item():.6f}, mean={heights.mean().item():.6f}")
+            
+            # 分析置信度分布
+            if hasattr(mapcalc, 'all_scores'):
+                all_scores = []
+                for scores in mapcalc.all_scores:
+                    if isinstance(scores, list) and scores:
+                        for score in scores:
+                            if isinstance(score, torch.Tensor):
+                                all_scores.append(score)
+                
+                if all_scores:
+                    all_scores = torch.cat(all_scores, dim=0)
+                    print(f"[EVAL DETAILED] Confidence: min={all_scores.min().item():.6f}, max={all_scores.max().item():.6f}, mean={all_scores.mean().item():.6f}")
+                    print(f"[EVAL DETAILED] Confidence distribution:")
+                    for threshold in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]:
+                        ratio = (all_scores >= threshold).float().mean().item()
+                        print(f"  - Score >= {threshold:.1f}: {ratio:.4f} ({int(ratio * 100)}%)")
+    
+    # 检查mAP为0的原因
+    if mAP == 0:
+        print("\n[EVAL DETAILED] *** mAP is ZERO: Possible causes ***")
+        print("  1. Predicted boxes have low IoU with ground truth (localization error)")
+        print("  2. Class predictions don't match ground truth (classification error)")
+        print("  3. Confidence scores might be miscalibrated")
+        print("  4. NMS might be too aggressive or too relaxed")
+        print("  5. Detection threshold might be too high")
+        
+        # 检查检测器是否返回空结果
+        if hasattr(mapcalc, 'all_detections'):
+            empty_count = sum(1 for dets in mapcalc.all_detections if not dets)
+            total_count = len(mapcalc.all_detections)
+            if empty_count > 0:
+                print(f"[EVAL DETAILED] {empty_count}/{total_count} images have NO detections")
+    
     return metrics
+
+def run_test(loader: DataLoader,
+             model: torch.nn.Module,
+             dry_run_steps: int = -1,
+             dataset="gen1"):
+
+    model.eval()
+    # 使用增强的mAP计算器
+    mapcalc = mAPCalculator(iou_threshold=0.5, num_classes=2)
+    
+    # 创建一个标准的DetectionBuffer用于兼容性
+    std_mapcalc = DetectionBuffer(height=loader.dataset.height, width=loader.dataset.width, classes=loader.dataset.classes)
+
+    print(f"[EVAL] Running evaluation...")
+    total_detections = 0
+    
+    # 创建目录保存可视化结果
+    vis_dir = 'detection_vis'
+    os.makedirs(vis_dir, exist_ok=True)
+    
+    # 获取类别名称映射
+    class_names = {0: 'car', 1: 'person'}  # 假设这是DSEC数据集的类别
+    
+    for i, data in enumerate(tqdm.tqdm(loader, desc="Evaluation")):
+        data = data.cuda()
+        data = format_data(data)
+        detections, targets = model(data)
+        
+        # 记录检测数量
+        if isinstance(detections, list):
+            batch_detections = sum(1 for d in detections if isinstance(d, dict) and len(d.get('boxes', [])) > 0)
+            total_detections += batch_detections
+        
+        if i % 10 == 0:
+            torch.cuda.empty_cache()
+        
+        # 使用标准评估器更新
+        std_mapcalc.update(detections, targets, dataset, data.height[0], data.width[0])
+        
+        # 对每个样本进行详细分析 - 减少打印频率，只对前几个batch详细分析
+        for batch_idx in range(data.num_graphs):
+            # 提取当前样本的GT框
+            target = targets[batch_idx] if batch_idx < len(targets) else None
+            detection = detections[batch_idx] if batch_idx < len(detections) else None
+            
+            if target is None or detection is None:
+                continue
+            
+            # 统一格式为XYXY
+            gt_boxes = target.get('boxes', torch.tensor([]))
+            gt_labels = target.get('labels', torch.tensor([]))
+            
+            pred_boxes = detection.get('boxes', torch.tensor([]))
+            pred_scores = detection.get('scores', torch.tensor([]))
+            pred_labels = detection.get('labels', torch.tensor([]))
+            
+            # 确保所有张量都在CPU上
+            gt_boxes = gt_boxes.cpu()
+            gt_labels = gt_labels.cpu()
+            pred_boxes = pred_boxes.cpu()
+            pred_scores = pred_scores.cpu()
+            pred_labels = pred_labels.cpu()
+            
+            # 跳过无效的检测结果
+            if len(gt_boxes) == 0 or len(pred_boxes) == 0:
+                continue
+            
+            # 更新增强mAP计算器
+            mapcalc.update(pred_boxes, pred_scores, pred_labels, gt_boxes, gt_labels)
+            
+            # 只对前5个batch的少数样本进行详细分析
+            if i < 5 and batch_idx < 2:  
+                print(f"\n[EVAL] Sample {i}-{batch_idx} Analysis:")
+                print(f"[EVAL] GT: {len(gt_boxes)} boxes, labels: {[class_names.get(l.item(), l.item()) for l in gt_labels]}")
+                print(f"[EVAL] Pred: {len(pred_boxes)} boxes")
+                
+                # 转换为XYXY格式用于计算IoU
+                gt_boxes_xyxy = gt_boxes if gt_boxes.shape[1] == 4 else xywh_to_xyxy(gt_boxes)
+                pred_boxes_xyxy = pred_boxes if pred_boxes.shape[1] == 4 else xywh_to_xyxy(pred_boxes)
+                
+                # 计算IoU矩阵
+                iou_matrix = box_iou(pred_boxes_xyxy, gt_boxes_xyxy)
+                
+                # 打印检测框的详细信息，仅打印前3个检测结果
+                print("[EVAL] Prediction details (showing top 3):")
+                for j, (box, score, label) in enumerate(zip(pred_boxes, pred_scores, pred_labels)):
+                    if j >= 3:  # 只打印前3个
+                        print("  ... and more detections")
+                        break
+                        
+                    # 找到与当前预测框IoU最大的GT框
+                    if j < iou_matrix.shape[0]:
+                        max_iou, max_gt_idx = iou_matrix[j].max().item(), iou_matrix[j].argmax().item()
+                        gt_label = gt_labels[max_gt_idx].item() if max_gt_idx < len(gt_labels) else -1
+                        
+                        match_status = "MATCH" if max_iou >= 0.5 and label.item() == gt_label else "NO MATCH"
+                        if max_iou >= 0.5 and label.item() != gt_label:
+                            match_status = "CLASS MISMATCH"
+                        elif max_iou < 0.5 and label.item() == gt_label:
+                            match_status = "LOW IoU"
+                        
+                        print(f"  #{j}: label={class_names.get(label.item(), label.item())}, "
+                              f"score={score.item():.4f}, "
+                              f"box={box.tolist()}, "
+                              f"max_iou={max_iou:.4f}, "
+                              f"status={match_status}")
+                
+                # 进行精确度/召回率分析
+                pr_analysis = analyze_precision_recall(
+                    gt_boxes_xyxy, gt_labels, 
+                    pred_boxes_xyxy, pred_labels, 
+                    pred_scores, iou_threshold=0.5
+                )
+                
+                print(f"[EVAL] Precision: {pr_analysis['precision']:.4f}, Recall: {pr_analysis['recall']:.4f}")
+                print(f"[EVAL] TP: {pr_analysis['TP']}, FP: {pr_analysis['FP']}, FN: {pr_analysis['FN']}")
+                
+                # 分析置信度分布
+                conf_analysis = analyze_confidence_distribution(
+                    pred_scores, pred_labels, 
+                    gt_boxes_xyxy, gt_labels, 
+                    iou_matrix
+                )
+                
+                # 保存检测结果可视化
+                try:
+                    # 提取原始图像
+                    if hasattr(data, 'x_rgb') and data.x_rgb is not None:
+                        orig_img = data.x_rgb[batch_idx].cpu()
+                        
+                        # 可视化结果
+                        vis_img = visualize_detections(
+                            orig_img, 
+                            gt_boxes_xyxy, 
+                            pred_boxes_xyxy,
+                            gt_labels=gt_labels,
+                            pred_labels=pred_labels,
+                            pred_scores=pred_scores,
+                            iou_matrix=iou_matrix,
+                            filename=f"{vis_dir}/sample_{i}_{batch_idx}.jpg"
+                        )
+                except Exception as e:
+                    print(f"[WARNING] Failed to visualize detection: {e}")
+        
+        if dry_run_steps > 0 and i == dry_run_steps:
+            break
+
+    print(f"[EVAL] Total detections across all batches: {total_detections}")
+    torch.cuda.empty_cache()
+    
+    # 计算增强版mAP
+    detailed_metrics = mapcalc.compute(verbose=True)
+    
+    # 返回标准计算器以保持兼容性
+    return std_mapcalc
 
 class LRSchedule:
     def __init__(self, warmup_epochs=0.5, num_iters_per_epoch=1000, tot_num_epochs=100):
