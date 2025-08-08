@@ -17,7 +17,7 @@ class ScaleExp(nn.Module):
 class FCOSHead(nn.Module):
     def __init__(self, num_classes=2, in_channels=[256, 256], strides=[8, 16], use_gn=True, 
                  feat_channels=256, init_prior=0.01, scale_exp_init=1.0, center_sampling=True, 
-                 center_radius=1.5):
+                 center_radius=3.5):  # 中心采样半径从1.5增加到3.5
         super().__init__()
         self.num_classes = num_classes
         self.strides = strides
@@ -89,7 +89,7 @@ class FCOSHead(nn.Module):
             self.cls_preds.append(nn.Conv2d(feat_channels, num_classes, 3, padding=1))
             self.reg_preds.append(nn.Conv2d(feat_channels, 4, 3, padding=1))
             self.centerness_preds.append(nn.Conv2d(feat_channels, 1, 3, padding=1))
-            self.scale_exps.append(ScaleExp(scale_exp_init))  # 可调参数
+            self.scale_exps.append(ScaleExp(scale_exp_init))
         
         # 初始化参数
         self._init_weights(init_prior)
@@ -103,14 +103,25 @@ class FCOSHead(nn.Module):
                         if m.bias is not None:
                             nn.init.constant_(m.bias, 0)
         
-        # 特别为预测层设置合适的初始化
+        # 修改: 为分类器设置类别特定的初始化，避免就地操作
         for modules in [self.cls_preds, self.reg_preds, self.centerness_preds]:
             for m in modules:
                 nn.init.normal_(m.weight, mean=0, std=0.01)
                 if m in self.cls_preds:
-                    # 使用负偏置以提高训练初期的稳定性
+                    # 计算初始偏置值
                     bias_value = -math.log((1 - init_prior) / init_prior)
-                    nn.init.constant_(m.bias, bias_value)
+                    
+                    if m.bias.shape[0] > 1:  # 确保有多个类别
+                        # 创建新的偏置张量而不是就地修改
+                        bias_data = torch.zeros_like(m.bias.data)
+                        # 类别0使用标准的负偏置
+                        bias_data[0] = -bias_value
+                        # 类别1使用更适中的偏置 - 从2.0降到1.0
+                        bias_data[1] = 1.0
+                        # 一次性设置整个张量
+                        m.bias.data.copy_(bias_data)
+                    else:
+                        nn.init.constant_(m.bias, -bias_value)
                 else:
                     nn.init.constant_(m.bias, 0)
     
@@ -165,7 +176,7 @@ class FCOSHead(nn.Module):
                     print(f"[DEBUG] Reg pred after scale exp: min={reg_pred.min().item():.4f}, max={reg_pred.max().item():.4f}, mean={reg_pred.mean().item():.4f}")
                 
                 # 限制回归预测的范围，防止过大的值
-                reg_pred = torch.clamp(reg_pred, min=0.0, max=100.0)  # 限制上限为100
+                reg_pred = torch.clamp(reg_pred, min=0.0, max=100.0)
                 
                 # 中心度预测
                 centerness = self.centerness_preds[i](reg_feat)
@@ -187,7 +198,6 @@ class FCOSHead(nn.Module):
         
         return cls_scores, reg_preds, centernesses
     
-
     def loss(self, cls_scores, reg_preds, centernesses, targets, strides=None):
         # 检查输入是否有效
         if not cls_scores or len(cls_scores) == 0:
@@ -195,9 +205,7 @@ class FCOSHead(nn.Module):
             device = next(self.parameters()).device if hasattr(self, 'parameters') else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
             
             # 创建一个需要梯度的零损失
-            # 使用模型参数确保损失有梯度
             dummy_param = next(self.parameters())
-            # 使用参数的均值乘以0，这样可以保持梯度流
             zero_loss = dummy_param.mean() * 0
             
             # 返回零损失
@@ -222,8 +230,8 @@ class FCOSHead(nn.Module):
         num_pos = 0
         total_locations = 0
         
-        # 增加类别1的权重（数据集中类比1很少，增加权重更容易学到）
-        class_weights = torch.tensor([1.0, 20.0], device=device)
+        # 记录每个类别的正样本数量
+        pos_samples_by_class = torch.zeros(self.num_classes, device=device)
         
         for level_idx, stride in enumerate(strides):
             if level_idx >= len(cls_scores):
@@ -291,14 +299,24 @@ class FCOSHead(nn.Module):
                 # 确定哪些点在目标框内部
                 inside_gt_mask = reg_targets.min(dim=-1)[0] > 0  # [num_locations, num_gts]
                 
-                # 实现中心区域采样（可选）
+                # 实现中心区域采样
                 if self.center_sampling:
                     # 计算中心区域
                     gt_centers = batch_targets[:, 1:3]  # [num_gts, 2] - [cx, cy]
                     
                     # 计算中心区域半径（与目标大小成比例）
-                    radius_x = self.center_radius * batch_targets[:, 3] / 2  # 宽度的一半 * 系数
-                    radius_y = self.center_radius * batch_targets[:, 4] / 2  # 高度的一半 * 系数
+                    # 修改: 根据类别调整中心采样半径 - 类别1使用更大的半径
+                    radius_x = torch.ones_like(gt_bbox[:, 2]) * self.center_radius
+                    radius_y = torch.ones_like(gt_bbox[:, 3]) * self.center_radius
+                    
+                    # 类别1使用更大的半径
+                    cls1_mask = gt_cls == 1
+                    if cls1_mask.any():
+                        radius_x[cls1_mask] = self.center_radius * 1.5  # 类别1的半径增加50%
+                        radius_y[cls1_mask] = self.center_radius * 1.5
+                    
+                    radius_x = radius_x * gt_bbox[:, 2] / 2  # 宽度的一半 * 系数
+                    radius_y = radius_y * gt_bbox[:, 3] / 2  # 高度的一半 * 系数
                     
                     # 计算每个位置到目标中心的距离
                     distances_x = (locations[:, 0].unsqueeze(1) - gt_centers[:, 0].unsqueeze(0)).abs()
@@ -341,6 +359,10 @@ class FCOSHead(nn.Module):
                 pos_inds = torch.nonzero(pos_mask).squeeze(1)
                 target_inds = min_area_inds[pos_mask]
                 
+                # 记录每个类别的正样本数量
+                for cls_id in range(self.num_classes):
+                    pos_samples_by_class[cls_id] += (gt_cls[target_inds] == cls_id).sum().item()
+                
                 # 记录类别分布
                 if self.debug_logger is not None:
                     self.debug_logger.log_cls_distribution(gt_cls[target_inds])
@@ -382,24 +404,55 @@ class FCOSHead(nn.Module):
                     print(f"  Positive ratio: {pos_inds.shape[0] / cls_pred_flat.shape[0] * 100:.2f}%")
                     print(f"  Class distribution: {torch.bincount(gt_cls[target_inds], minlength=self.num_classes)}")
                 
-                # 修改这里：使用类别权重计算分类损失
-                # 使用焦点损失代替二元交叉熵损失
-                gamma = 2.0  # 焦点损失的gamma参数
-                alpha = 0.25  # 焦点损失的alpha参数
+                # 动态调整类别权重
+                if num_pos_level > 0:
+                    cls_counts = torch.bincount(gt_cls[target_inds], minlength=self.num_classes)
+                    
+                    # 如果类别1的样本数量很少或为零，给它一个较高的权重
+                    if cls_counts[1] < 3:
+                        class_weights = torch.tensor([1.0, 100.0], device=device)
+                    else:
+                        # 基于类别比例动态调整权重
+                        cls_ratio = max(1.0, cls_counts[0].float() / max(cls_counts[1].float(), 1))
+                        # 类别1的权重至少是30，且随着比例增加而增加，上限为50
+                        class_weights = torch.tensor([1.0, min(50.0, max(30.0, cls_ratio * 5))], device=device)
+                    
+                    print(f"[WEIGHT] Class distribution: {cls_counts.tolist()}, weights: {class_weights.tolist()}")
+                else:
+                    # 默认权重
+                    class_weights = torch.tensor([1.0, 50.0], device=device)
+                
+                # 修改: 使用焦点损失并增加类别1的权重
+                gamma = 4.0  # 增加gamma以更关注困难样本
+                alpha = 0.25
                 
                 # 计算焦点损失
                 pred_sigmoid = torch.sigmoid(pos_cls_preds)
                 pt = pred_sigmoid * pos_cls_targets + (1 - pred_sigmoid) * (1 - pos_cls_targets)
                 focal_weight = (alpha * pos_cls_targets + (1 - alpha) * (1 - pos_cls_targets)) * (1 - pt).pow(gamma)
                 
-                # 添加类别权重
+                # 为类别1增加额外权重
+                cls1_mask = gt_cls[target_inds] == 1
+                cls1_indices = torch.nonzero(cls1_mask).squeeze(1)
+                if len(cls1_indices) > 0:
+                    # 为类别1的样本位置创建掩码
+                    sample_cls1_mask = torch.zeros_like(pos_cls_targets, dtype=torch.bool)
+                    for i in range(len(cls1_indices)):
+                        sample_cls1_mask[cls1_indices[i], 1] = True
+                    
+                    # 为类别1样本增加额外权重 - 稍微降低从2.0到1.5
+                    focal_weight[sample_cls1_mask] = focal_weight[sample_cls1_mask] * 1.5
+                
+                # 类别权重应用到分类损失
+                cls_loss_weight = class_weights.unsqueeze(0).expand_as(pos_cls_targets)
+                
+                # 计算分类损失
                 cls_loss = cls_loss + F.binary_cross_entropy_with_logits(
                     pos_cls_preds, pos_cls_targets, reduction='none', 
-                    pos_weight=class_weights.unsqueeze(0)  # 为类别1增加权重
+                    pos_weight=cls_loss_weight  # 使用类别权重
                 ).mul(focal_weight).sum()
                 
                 # 计算回归损失
-                # 使用IoU损失
                 pred_boxes = self._distance2bbox(locations[pos_inds], pos_reg_preds)
                 target_boxes = self._distance2bbox(locations[pos_inds], pos_reg_targets)
                 
@@ -410,7 +463,7 @@ class FCOSHead(nn.Module):
                     print(f"[DEBUG] Pred boxes stats: min={pred_boxes.min().item():.4f}, max={pred_boxes.max().item():.4f}")
                     print(f"[DEBUG] Target boxes stats: min={target_boxes.min().item():.4f}, max={target_boxes.max().item():.4f}")
                 
-                # 使用GIoU损失替代普通IoU损失
+                # 使用GIoU损失
                 giou_loss = self._calculate_giou_loss(pred_boxes, target_boxes)
                 
                 # 检查giou_loss是否包含NaN
@@ -425,11 +478,48 @@ class FCOSHead(nn.Module):
                 ctr_loss = ctr_loss + F.binary_cross_entropy_with_logits(
                     pos_centerness_preds, centerness_targets, reduction='sum'
                 )
+                
+                # 硬负样本挖掘
+                neg_mask = ~pos_mask
+                neg_inds = torch.nonzero(neg_mask).squeeze(1)
+                
+                if len(neg_inds) > 0 and len(pos_inds) > 0:
+                    # 计算负样本的分类损失
+                    neg_cls_preds = cls_pred_flat[neg_inds]
+                    neg_cls_targets = torch.zeros_like(neg_cls_preds)
+                    
+                    # 计算负样本损失
+                    neg_loss = F.binary_cross_entropy_with_logits(
+                        neg_cls_preds, neg_cls_targets, reduction='none'
+                    )
+                    
+                    # 求和得到每个负样本的总损失
+                    neg_loss_sum = neg_loss.sum(dim=1)
+                    
+                    # 选择最难的负样本（损失最高的）
+                    num_hard_negs = min(len(neg_inds), len(pos_inds) * 3)  # 负样本数量为正样本的3倍
+                    
+                    _, hard_neg_indices = neg_loss_sum.topk(num_hard_negs)
+                    hard_neg_inds = neg_inds[hard_neg_indices]
+                    
+                    # 使用硬负样本计算分类损失
+                    hard_neg_cls_preds = cls_pred_flat[hard_neg_inds]
+                    hard_neg_cls_targets = torch.zeros_like(hard_neg_cls_preds)
+                    
+                    # 计算硬负样本分类损失
+                    neg_cls_loss = F.binary_cross_entropy_with_logits(
+                        hard_neg_cls_preds, hard_neg_cls_targets, reduction='sum'
+                    )
+                    
+                    # 添加到总分类损失
+                    cls_loss = cls_loss + neg_cls_loss
         
         # 平均损失
-        # 增加日志打印
         print(f"[LOSS-STATS] Total positive samples: {num_pos}, Total locations: {total_locations}")
         print(f"[LOSS-STATS] Positive ratio: {num_pos / max(1, total_locations) * 100:.4f}%")
+        
+        # 打印每个类别的正样本数量
+        print(f"[CLASS-STATS] Class 0: {pos_samples_by_class[0]}, Class 1: {pos_samples_by_class[1]}")
         
         num_pos = max(1, num_pos)
         cls_loss = cls_loss / num_pos
@@ -456,268 +546,6 @@ class FCOSHead(nn.Module):
             'loss_ctr': ctr_loss,
             'total_loss': total_loss
         }
-    # def loss(self, cls_scores, reg_preds, centernesses, targets, strides=None):
-    #     # 检查输入是否有效
-    #     if not cls_scores or len(cls_scores) == 0:
-    #         # 获取设备，默认使用CPU
-    #         device = next(self.parameters()).device if hasattr(self, 'parameters') else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-            
-    #         # 创建一个需要梯度的零损失
-    #         # 使用模型参数确保损失有梯度
-    #         dummy_param = next(self.parameters())
-    #         # 使用参数的均值乘以0，这样可以保持梯度流
-    #         zero_loss = dummy_param.mean() * 0
-            
-    #         # 返回零损失
-    #         return {
-    #             'loss_cls': zero_loss,
-    #             'loss_reg': zero_loss,
-    #             'loss_ctr': zero_loss,
-    #             'total_loss': zero_loss
-    #         }
-            
-    #     device = cls_scores[0].device
-    #     batch_size = cls_scores[0].shape[0]
-    #     strides = strides or self.strides
-        
-    #     # 初始化损失 - 确保损失有梯度
-    #     dummy_param = next(self.parameters())
-    #     cls_loss = dummy_param.new_tensor(0.0, requires_grad=True)
-    #     reg_loss = dummy_param.new_tensor(0.0, requires_grad=True)
-    #     ctr_loss = dummy_param.new_tensor(0.0, requires_grad=True)
-        
-    #     # 统计正样本数量
-    #     num_pos = 0
-    #     total_locations = 0
-        
-    #     for level_idx, stride in enumerate(strides):
-    #         if level_idx >= len(cls_scores):
-    #             continue
-                
-    #         # 获取当前特征层的预测
-    #         cls_pred = cls_scores[level_idx]
-    #         reg_pred = reg_preds[level_idx]
-    #         centerness_pred = centernesses[level_idx]
-            
-    #         # 特征图大小
-    #         h, w = cls_pred.shape[2:]
-            
-    #         # 生成网格点坐标
-    #         grid_y, grid_x = torch.meshgrid(
-    #             torch.arange(h, device=device),
-    #             torch.arange(w, device=device),
-    #             indexing='ij'
-    #         )
-    #         # 将网格点坐标转换为原图坐标
-    #         locations = torch.stack([
-    #             (grid_x + 0.5) * stride,
-    #             (grid_y + 0.5) * stride
-    #         ], dim=-1)  # [h, w, 2]
-            
-    #         # 展平网格坐标
-    #         locations = locations.view(-1, 2)  # [h*w, 2]
-    #         total_locations += locations.shape[0]
-            
-    #         # 处理每个批次
-    #         for batch_idx in range(batch_size):
-    #             if batch_idx >= len(targets):
-    #                 continue
-                
-    #             # 获取当前批次的目标
-    #             batch_targets = targets[batch_idx]
-    #             if batch_targets.numel() == 0:
-    #                 continue
-                
-    #             # 获取目标的类别和边界框
-    #             gt_cls = batch_targets[:, 0].long()
-    #             gt_bbox = batch_targets[:, 1:5]  # [cx, cy, w, h]
-                
-    #             # 只在第一次迭代时打印目标边界框信息
-    #             verbose = self.debug_logger is None or self.debug_logger.iteration <= 1
-    #             if verbose:
-    #                 print(f"[DEBUG] GT bbox for batch {batch_idx}: {gt_bbox}")
-                
-    #             # 将目标框转换为XYXY格式
-    #             gt_x1 = gt_bbox[:, 0] - gt_bbox[:, 2] / 2
-    #             gt_y1 = gt_bbox[:, 1] - gt_bbox[:, 3] / 2
-    #             gt_x2 = gt_bbox[:, 0] + gt_bbox[:, 2] / 2
-    #             gt_y2 = gt_bbox[:, 1] + gt_bbox[:, 3] / 2
-                
-    #             # 计算每个网格点到目标框四边的距离
-    #             xs, ys = locations[:, 0].unsqueeze(1), locations[:, 1].unsqueeze(1)
-    #             left = xs - gt_x1.unsqueeze(0)     # 左边距离
-    #             top = ys - gt_y1.unsqueeze(0)      # 上边距离
-    #             right = gt_x2.unsqueeze(0) - xs    # 右边距离
-    #             bottom = gt_y2.unsqueeze(0) - ys   # 下边距离
-                
-    #             # 计算回归目标，形状为[num_locations, num_gts, 4]
-    #             reg_targets = torch.stack([left, top, right, bottom], dim=-1)
-                
-    #             # 确定哪些点在目标框内部
-    #             inside_gt_mask = reg_targets.min(dim=-1)[0] > 0  # [num_locations, num_gts]
-                
-    #             # 实现中心区域采样（可选）
-    #             if self.center_sampling:
-    #                 # 计算中心区域
-    #                 gt_centers = batch_targets[:, 1:3]  # [num_gts, 2] - [cx, cy]
-                    
-    #                 # 计算中心区域半径（与目标大小成比例）
-    #                 radius_x = self.center_radius * batch_targets[:, 3] / 2  # 宽度的一半 * 系数
-    #                 radius_y = self.center_radius * batch_targets[:, 4] / 2  # 高度的一半 * 系数
-                    
-    #                 # 计算每个位置到目标中心的距离
-    #                 distances_x = (locations[:, 0].unsqueeze(1) - gt_centers[:, 0].unsqueeze(0)).abs()
-    #                 distances_y = (locations[:, 1].unsqueeze(1) - gt_centers[:, 1].unsqueeze(0)).abs()
-                    
-    #                 # 判断是否在中心区域内
-    #                 inside_center_x = distances_x < radius_x.unsqueeze(0)
-    #                 inside_center_y = distances_y < radius_y.unsqueeze(0)
-    #                 inside_center = inside_center_x & inside_center_y
-                    
-    #                 # 结合框内和中心区域条件
-    #                 inside_gt_mask = inside_gt_mask & inside_center
-                
-    #             # 跳过没有正样本的情况
-    #             if not inside_gt_mask.any():
-    #                 continue
-                
-    #             # 对于每个位置，选择面积最小的目标框
-    #             areas = (gt_x2 - gt_x1) * (gt_y2 - gt_y1)  # [num_gts]
-    #             areas = areas.unsqueeze(0).expand(locations.size(0), -1)  # [num_locations, num_gts]
-                
-    #             # 复制areas以避免修改原始张量
-    #             areas_for_min = areas.clone()
-    #             areas_for_min[~inside_gt_mask] = 1e9  # 使用较大的值替代inf，避免NaN
-    #             min_area_inds = areas_for_min.argmin(dim=1)    # [num_locations]
-                
-    #             # 正样本掩码
-    #             pos_mask = inside_gt_mask.any(dim=1)   # [num_locations]
-    #             num_pos_level = pos_mask.sum().item()
-    #             if num_pos_level == 0:
-    #                 continue
-                
-    #             # 记录正样本数量
-    #             if self.debug_logger is not None:
-    #                 self.debug_logger.log_pos_samples(num_pos_level)
-                    
-    #             num_pos += num_pos_level
-                
-    #             # 获取每个正样本对应的GT
-    #             pos_inds = torch.nonzero(pos_mask).squeeze(1)
-    #             target_inds = min_area_inds[pos_mask]
-                
-    #             # 记录类别分布
-    #             if self.debug_logger is not None:
-    #                 self.debug_logger.log_cls_distribution(gt_cls[target_inds])
-                
-    #             # 获取正样本的回归目标
-    #             pos_reg_targets = reg_targets[pos_inds, min_area_inds[pos_mask]]  # [num_pos, 4]
-                
-    #             # 计算centerness目标，添加小的常数避免除零
-    #             left_right = pos_reg_targets[:, [0, 2]]
-    #             top_bottom = pos_reg_targets[:, [1, 3]]
-                
-    #             # 确保分母不为零
-    #             max_left_right = torch.max(left_right, dim=1)[0].clamp(min=1e-6)
-    #             max_top_bottom = torch.max(top_bottom, dim=1)[0].clamp(min=1e-6)
-                
-    #             centerness_targets = torch.sqrt(
-    #                 (torch.min(left_right, dim=1)[0] / max_left_right) *
-    #                 (torch.min(top_bottom, dim=1)[0] / max_top_bottom)
-    #             )
-                
-    #             # 获取预测值
-    #             cls_pred_flat = cls_pred[batch_idx].permute(1, 2, 0).reshape(-1, self.num_classes)
-    #             reg_pred_flat = reg_pred[batch_idx].permute(1, 2, 0).reshape(-1, 4)
-    #             centerness_pred_flat = centerness_pred[batch_idx].permute(1, 2, 0).reshape(-1)
-                
-    #             # 获取正样本的预测
-    #             pos_cls_preds = cls_pred_flat[pos_inds]
-    #             pos_reg_preds = reg_pred_flat[pos_inds]
-    #             pos_centerness_preds = centerness_pred_flat[pos_inds]
-                
-    #             # 创建分类目标
-    #             pos_cls_targets = torch.zeros_like(pos_cls_preds)
-    #             pos_cls_targets[torch.arange(len(pos_inds)), gt_cls[target_inds]] = 1.0
-                
-    #             # 打印分类统计信息
-    #             if verbose and batch_idx == 0 and level_idx == 0:
-    #                 print(f"[CLS-STATS] Level {level_idx}, Batch {batch_idx}:")
-    #                 print(f"  Total locations: {cls_pred_flat.shape[0]}, Positive samples: {pos_inds.shape[0]}")
-    #                 print(f"  Positive ratio: {pos_inds.shape[0] / cls_pred_flat.shape[0] * 100:.2f}%")
-    #                 print(f"  Class distribution: {torch.bincount(gt_cls[target_inds], minlength=self.num_classes)}")
-                
-    #             # 使用焦点损失代替二元交叉熵损失
-    #             gamma = 2.0  # 焦点损失的gamma参数
-    #             alpha = 0.25  # 焦点损失的alpha参数
-                
-    #             # 计算焦点损失
-    #             pred_sigmoid = torch.sigmoid(pos_cls_preds)
-    #             pt = pred_sigmoid * pos_cls_targets + (1 - pred_sigmoid) * (1 - pos_cls_targets)
-    #             focal_weight = (alpha * pos_cls_targets + (1 - alpha) * (1 - pos_cls_targets)) * (1 - pt).pow(gamma)
-                
-    #             cls_loss = cls_loss + F.binary_cross_entropy_with_logits(
-    #                 pos_cls_preds, pos_cls_targets, reduction='none'
-    #             ).mul(focal_weight).sum()
-                
-    #             # 计算回归损失
-    #             # 使用IoU损失
-    #             pred_boxes = self._distance2bbox(locations[pos_inds], pos_reg_preds)
-    #             target_boxes = self._distance2bbox(locations[pos_inds], pos_reg_targets)
-                
-    #             # 记录边界框统计信息
-    #             if self.debug_logger is not None:
-    #                 self.debug_logger.log_boxes(pred_boxes, target_boxes)
-    #             elif verbose:
-    #                 print(f"[DEBUG] Pred boxes stats: min={pred_boxes.min().item():.4f}, max={pred_boxes.max().item():.4f}")
-    #                 print(f"[DEBUG] Target boxes stats: min={target_boxes.min().item():.4f}, max={target_boxes.max().item():.4f}")
-                
-    #             # 使用GIoU损失替代普通IoU损失
-    #             giou_loss = self._calculate_giou_loss(pred_boxes, target_boxes)
-                
-    #             # 检查giou_loss是否包含NaN
-    #             if torch.isnan(giou_loss).any():
-    #                 print(f"[WARNING] NaN in giou_loss, replacing with zeros")
-    #                 giou_loss = torch.where(torch.isnan(giou_loss), torch.zeros_like(giou_loss), giou_loss)
-                
-    #             # 使用centerness权重
-    #             reg_loss = reg_loss + (giou_loss * centerness_targets).sum()
-                
-    #             # 计算centerness损失
-    #             ctr_loss = ctr_loss + F.binary_cross_entropy_with_logits(
-    #                 pos_centerness_preds, centerness_targets, reduction='sum'
-    #             )
-        
-    #     # 平均损失
-    #     # 增加日志打印
-    #     print(f"[LOSS-STATS] Total positive samples: {num_pos}, Total locations: {total_locations}")
-    #     print(f"[LOSS-STATS] Positive ratio: {num_pos / max(1, total_locations) * 100:.4f}%")
-        
-    #     num_pos = max(1, num_pos)
-    #     cls_loss = cls_loss / num_pos
-    #     reg_loss = reg_loss / num_pos
-    #     ctr_loss = ctr_loss / num_pos
-        
-    #     # 检查损失是否为NaN
-    #     if torch.isnan(cls_loss):
-    #         print(f"[WARNING] cls_loss is NaN, replacing with zero")
-    #         cls_loss = torch.zeros_like(cls_loss)
-    #     if torch.isnan(reg_loss):
-    #         print(f"[WARNING] reg_loss is NaN, replacing with zero")
-    #         reg_loss = torch.zeros_like(reg_loss)
-    #     if torch.isnan(ctr_loss):
-    #         print(f"[WARNING] ctr_loss is NaN, replacing with zero")
-    #         ctr_loss = torch.zeros_like(ctr_loss)
-        
-    #     # 确保所有损失都有梯度
-    #     total_loss = cls_loss + reg_loss + ctr_loss
-        
-    #     return {
-    #         'loss_cls': cls_loss,
-    #         'loss_reg': reg_loss,
-    #         'loss_ctr': ctr_loss,
-    #         'total_loss': total_loss
-    #     }
     
     def _calculate_giou_loss(self, pred_boxes, target_boxes):
         # 计算IoU损失的增强版本：GIoU Loss
@@ -786,7 +614,14 @@ class FCOSHead(nn.Module):
         
         return iou
     
-    def get_bboxes(self, cls_scores, reg_preds, centernesses, score_thr=0.001, nms_thr=0.6, max_num=100):
+    def get_bboxes(self, cls_scores, reg_preds, centernesses, score_thr=0.001, nms_thr=0.6, max_num=100, 
+                  score_thr_cls1=None, nms_thr_cls1=None):
+        # 类别特定的阈值
+        score_thr_cls0 = 0.2  # 为类别0添加特定阈值
+        score_thr_cls1 = 0.1 if score_thr_cls1 is None else score_thr_cls1
+        nms_thr_cls0 = nms_thr + 0.05  # 为类别0也提供稍宽松的NMS阈值
+        nms_thr_cls1 = nms_thr + 0.1 if nms_thr_cls1 is None else nms_thr_cls1
+        
         # 检查输入是否有效
         if not cls_scores or len(cls_scores) == 0:
             device = next(self.parameters()).device if hasattr(self, 'parameters') else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -808,13 +643,16 @@ class FCOSHead(nn.Module):
                 f"min={sigmoid_scores.min().item():.4f}")
             print(f"  Level {level_idx}: # scores > 0.5: {(sigmoid_scores > 0.5).sum().item()}")
             print(f"  Level {level_idx}: # scores > 0.25: {(sigmoid_scores > 0.25).sum().item()}")
+            print(f"  Level {level_idx}: # scores > 0.1: {(sigmoid_scores > 0.1).sum().item()}")
             
             # 打印每个类别的分数分布
             for cls_idx in range(sigmoid_scores.shape[1]):
                 cls_scores_i = sigmoid_scores[:, cls_idx]
                 print(f"    Class {cls_idx}: mean={cls_scores_i.mean().item():.4f}, "
                     f"max={cls_scores_i.max().item():.4f}, "
-                    f"# > 0.5: {(cls_scores_i > 0.5).sum().item()}")
+                    f"# > 0.5: {(cls_scores_i > 0.5).sum().item()}, "
+                    f"# > 0.3: {(cls_scores_i > 0.3).sum().item()}, "
+                    f"# > 0.1: {(cls_scores_i > 0.1).sum().item()}")
         
         result_list = []
         for batch_idx in range(batch_size):
@@ -857,8 +695,16 @@ class FCOSHead(nn.Module):
                 # 转换回归预测为边界框
                 bboxes = self._distance2bbox(points, reg_pred_flat)
                 
-                # 将分类分数和中心度结合
-                scores = torch.sigmoid(cls_score_flat) * torch.sigmoid(centerness_flat).unsqueeze(1)
+                # 修改: 分类分数计算 - 为类别1提供适度的分数提升
+                cls_sigmoid = torch.sigmoid(cls_score_flat)
+                ctr_sigmoid = torch.sigmoid(centerness_flat).unsqueeze(1)
+                
+                # 为类别1提供更适中的分数提升 - 从2.0降到1.2
+                cls_boost = torch.ones_like(cls_sigmoid)
+                cls_boost[:, 1] = 1.2  # 类别1的分数适度提升
+                
+                # 最终得分计算
+                scores = cls_sigmoid * ctr_sigmoid * cls_boost
                 
                 # 收集该层级的预测
                 multi_level_bboxes.append(bboxes)
@@ -901,17 +747,37 @@ class FCOSHead(nn.Module):
             # 获取每个位置最高分数和对应类别
             max_scores, labels = scores.max(dim=1)
             
-            # 过滤低分数预测
-            keep = max_scores > score_thr
-            bboxes = bboxes[keep]
-            scores = max_scores[keep]
-            labels = labels[keep]
+            # 修改: 使用类别特定的分数阈值
+            keep_mask = torch.zeros_like(max_scores, dtype=torch.bool)
+            
+            # 类别0使用特定阈值
+            cls0_mask = (labels == 0)
+            keep_mask[cls0_mask] = max_scores[cls0_mask] > score_thr_cls0
+            
+            # 类别1使用更低的阈值
+            cls1_mask = (labels == 1)
+            keep_mask[cls1_mask] = max_scores[cls1_mask] > score_thr_cls1
+            
+            # 基于掩码过滤
+            bboxes = bboxes[keep_mask]
+            scores = max_scores[keep_mask]
+            labels = labels[keep_mask]
             
             # 打印阈值过滤后的框统计
             print(f"[INFERENCE] Batch {batch_idx}: {bboxes.shape[0]} boxes after score threshold")
             if bboxes.shape[0] > 0:
                 print(f"  Score range: [{scores.min().item():.4f}, {scores.max().item():.4f}]")
                 print(f"  Class distribution: {torch.bincount(labels, minlength=self.num_classes)}")
+                
+                # 打印每个类别的分数统计
+                for cls_id in range(self.num_classes):
+                    cls_mask = labels == cls_id
+                    if cls_mask.sum() > 0:
+                        cls_scores = scores[cls_mask]
+                        print(f"  Class {cls_id} scores: min={cls_scores.min().item():.4f}, "
+                            f"max={cls_scores.max().item():.4f}, "
+                            f"mean={cls_scores.mean().item():.4f}, "
+                            f"count={cls_mask.sum().item()}")
             
             # 如果没有通过分数阈值的框，返回空结果
             if bboxes.numel() == 0:
@@ -922,8 +788,8 @@ class FCOSHead(nn.Module):
                 })
                 continue
             
-            # 应用NMS
-            keep = self._nms(bboxes, scores, labels, nms_thr)
+            # 应用类别特定的NMS
+            keep = self._nms(bboxes, scores, labels, nms_thr, nms_thr_cls0, nms_thr_cls1)
             
             # 打印NMS后的框统计
             print(f"[INFERENCE] Batch {batch_idx}: {len(keep)} boxes after NMS")
@@ -946,7 +812,7 @@ class FCOSHead(nn.Module):
             final_scores = scores[keep]
             final_labels = labels[keep]
             
-            # 新增: 打印详细的预测框信息
+            # 打印详细的预测框信息
             print(f"[PRED-BOXES] Batch {batch_idx}: {len(keep)} final predictions")
             if len(keep) > 0:
                 # 按分数排序
@@ -979,28 +845,37 @@ class FCOSHead(nn.Module):
         total_detections = sum(len(result['boxes']) for result in result_list)
         print(f"[DETECTION-SUMMARY] Total detections: {total_detections} across {batch_size} batches")
         if total_detections > 0:
-            all_labels = torch.cat([result['labels'] for result in result_list if len(result['labels']) > 0])
-            all_scores = torch.cat([result['scores'] for result in result_list if len(result['scores']) > 0])
+            # 收集所有检测结果的标签和分数
+            all_labels_list = [result['labels'] for result in result_list if len(result['labels']) > 0]
+            all_scores_list = [result['scores'] for result in result_list if len(result['scores']) > 0]
             
-            # 类别分布
-            label_counts = torch.bincount(all_labels, minlength=self.num_classes)
-            print(f"  Class distribution: {label_counts.tolist()}")
-            
-            # 分数统计
-            for cls_id in range(self.num_classes):
-                cls_mask = all_labels == cls_id
-                if cls_mask.sum() > 0:
-                    cls_scores = all_scores[cls_mask]
-                    print(f"  Class {cls_id} scores: min={cls_scores.min().item():.4f}, "
-                        f"max={cls_scores.max().item():.4f}, "
-                        f"mean={cls_scores.mean().item():.4f}, "
-                        f"count={cls_scores.shape[0]}")
+            # 修复：检查列表是否为空
+            if len(all_labels_list) > 0 and len(all_scores_list) > 0:
+                all_labels = torch.cat(all_labels_list)
+                all_scores = torch.cat(all_scores_list)
+                
+                # 类别分布
+                label_counts = torch.bincount(all_labels, minlength=self.num_classes)
+                print(f"  Class distribution: {label_counts.tolist()}")
+                
+                # 分数统计
+                for cls_id in range(self.num_classes):
+                    cls_mask = all_labels == cls_id
+                    if cls_mask.sum() > 0:
+                        cls_scores = all_scores[cls_mask]
+                        print(f"  Class {cls_id} scores: min={cls_scores.min().item():.4f}, "
+                            f"max={cls_scores.max().item():.4f}, "
+                            f"mean={cls_scores.mean().item():.4f}, "
+                            f"count={cls_scores.shape[0]}")
         
         return result_list
     
-    def _nms(self, bboxes, scores, labels, threshold):
+    def _nms(self, bboxes, scores, labels, threshold, threshold_cls0=None, threshold_cls1=None):
         if bboxes.numel() == 0:
             return torch.tensor([], device=bboxes.device, dtype=torch.long)
+        
+        threshold_cls0 = threshold + 0.05 if threshold_cls0 is None else threshold_cls0
+        threshold_cls1 = threshold + 0.1 if threshold_cls1 is None else threshold_cls1
         
         keep = []
         for cls in labels.unique():
@@ -1008,6 +883,14 @@ class FCOSHead(nn.Module):
             cls_mask = labels == cls
             cls_bboxes = bboxes[cls_mask]
             cls_scores = scores[cls_mask]
+            
+            # 类别特定的NMS阈值
+            if cls == 0:
+                cls_threshold = threshold_cls0
+            elif cls == 1:
+                cls_threshold = threshold_cls1
+            else:
+                cls_threshold = threshold
             
             # 原始索引
             cls_inds = torch.nonzero(cls_mask).squeeze(1)
@@ -1045,8 +928,8 @@ class FCOSHead(nn.Module):
                 # 计算IoU，添加小的常数避免除零
                 iou = inter / (areas[i] + areas[order[1:]] - inter + 1e-6)
                 
-                # 保留IoU小于阈值的框
-                inds = (iou <= threshold).nonzero().squeeze(1)
+                # 保留IoU小于阈值的框 - 使用类别特定的阈值
+                inds = (iou <= cls_threshold).nonzero().squeeze(1)
                 if inds.numel() == 0:
                     break
                 order = order[inds + 1]
@@ -1055,8 +938,6 @@ class FCOSHead(nn.Module):
             keep.extend(cls_inds[keep_cls].tolist())
         
         return torch.tensor(keep, device=bboxes.device, dtype=torch.long)
-
-
 
 
 

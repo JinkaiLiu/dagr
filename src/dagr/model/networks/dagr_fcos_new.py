@@ -14,7 +14,7 @@ from dagr.model.utils import (
 
 
 class DebugLogger:
-    def __init__(self, print_interval=200):  # 修改为200，减少打印频率
+    def __init__(self, print_interval=200):
         self.print_interval = print_interval
         self.iteration = 0
         self.feature_stats_printed = False
@@ -63,7 +63,6 @@ class DebugLogger:
             self.cls_distribution[cls_id].append(count)
     
     def log_detailed_box_info(self, gt_boxes, pred_boxes=None, batch_idx=0, max_boxes=5):
-        # 仅在特定迭代次数打印
         if self.iteration % self.print_interval != 0:
             return
             
@@ -142,7 +141,6 @@ class DebugLogger:
 
 def unpack_fused_features(fused_feat, debug_logger=None):
     features_tensor = []
-    # 只在第一次迭代或200次间隔时打印详细信息
     verbose = debug_logger is None or (debug_logger.iteration <= 1 or debug_logger.iteration % 200 == 0)
     
     if verbose:
@@ -231,13 +229,19 @@ def unpack_fused_features(fused_feat, debug_logger=None):
 class DAGR_FCOS(nn.Module):
     def __init__(self, args, height, width):
         super().__init__()
+        # 修改: 为类别1设置更低的检测阈值
         self.conf_threshold = args.score_threshold if hasattr(args, 'score_threshold') else 0.05
+        self.conf_threshold_cls1 = 0.1  # 类别1使用更低的阈值
+        
         self.nms_threshold = args.nms_iou_threshold if hasattr(args, 'nms_iou_threshold') else 0.6
+        # 修改: 为类别1设置更宽松的NMS阈值
+        self.nms_threshold_cls1 = min(0.7, self.nms_threshold + 0.1)
+        
         self.height = height
         self.width = width
         self.args = args
         
-        self.debug_logger = DebugLogger(print_interval=200)  # 修改为200，减少打印频率
+        self.debug_logger = DebugLogger(print_interval=200)
 
         self.backbone = Net(args, height=height, width=width)
         self.use_image = getattr(args, "use_image", False)
@@ -249,14 +253,16 @@ class DAGR_FCOS(nn.Module):
         
         print(f"[INFO] Using in_channels: {in_channels} for FCOS head")
         
-        # 修改初始化参数
+        # 修改: FCOSHead初始化参数，增加中心采样半径，修改scale_exp_init
         self.head = FCOSHead(
             num_classes=self.backbone.num_classes,
             in_channels=in_channels,
             strides=strides,
             use_gn=True,
-            init_prior=0.01,  # 降低分类器先验概率以减少早期阶段的大量假阳性
-            scale_exp_init=1.0  # 重要：影响回归值的尺度
+            init_prior=0.01,
+            scale_exp_init=1.0,
+            center_sampling=True,
+            center_radius=3.5  # 增加中心采样半径，从默认的1.5增加到3.5
         )
 
         if self.use_image:
@@ -270,7 +276,9 @@ class DAGR_FCOS(nn.Module):
                 num_classes=self.backbone.num_classes,
                 in_channels=cnn_channels[:2],
                 strides=strides,
-                use_gn=True
+                use_gn=True,
+                center_sampling=True,
+                center_radius=3.5  # 保持一致的中心采样半径
             )
 
         if "img_net_checkpoint" in args:
@@ -292,7 +300,7 @@ class DAGR_FCOS(nn.Module):
             if k in self.loss_recorder:
                 self.loss_recorder[k].append(v.item())
         
-        if self.loss_recorder['iteration'] % 200 == 0:  # 修改为200，减少打印频率
+        if self.loss_recorder['iteration'] % 200 == 0:
             avg_losses = {}
             for k in ['loss_cls', 'loss_reg', 'loss_ctr', 'total_loss']:
                 if len(self.loss_recorder[k]) > 0:
@@ -328,6 +336,11 @@ class DAGR_FCOS(nn.Module):
                 print(f"[DEBUG] 类别ID范围: [{bbox[:, 4].min().item():.2f}, {bbox[:, 4].max().item():.2f}]")
                 print(f"[DEBUG] 高度范围: [{bbox[:, 2].min().item():.2f}, {bbox[:, 2].max().item():.2f}]")
                 print(f"[DEBUG] 宽度范围: [{bbox[:, 3].min().item():.2f}, {bbox[:, 3].max().item():.2f}]")
+                
+                # 打印每个类别的实例数量
+                if bbox.shape[0] > 0:
+                    cls_counts = torch.bincount(bbox[:, 4].long(), minlength=2)
+                    print(f"[DEBUG] 类别分布: 类别0={cls_counts[0].item()}, 类别1={cls_counts[1].item()}")
         
         # 新增: 修复高度为0的问题
         if bbox.shape[1] >= 5:
@@ -430,7 +443,8 @@ class DAGR_FCOS(nn.Module):
                 if should_print and (batch_idx == 0 or batch_bboxes.shape[0] > 0):
                     print(f"[DEBUG] Batch {batch_idx}: 有效框 {x_center.shape[0]}/{batch_bboxes.shape[0]}")
                     if x_center.shape[0] > 0:
-                        print(f"  - 类别分布: {torch.bincount(cls.long(), minlength=2)}")
+                        cls_counts = torch.bincount(cls, minlength=2)
+                        print(f"  - 类别分布: 类别0={cls_counts[0].item()}, 类别1={cls_counts[1].item()}")
                         print(f"  - 中心点 x: [{x_center.min().item():.1f}, {x_center.max().item():.1f}], y: [{y_center.min().item():.1f}, {y_center.max().item():.1f}]")
                         print(f"  - 尺寸 w: [{width.min().item():.1f}, {width.max().item():.1f}], h: [{height.min().item():.1f}, {height.max().item():.1f}]")
                 
@@ -456,6 +470,11 @@ class DAGR_FCOS(nn.Module):
                 print(f"[GT-STATS] Input GT boxes: {x.bbox.shape}, batch indices: {x.bbox_batch.shape}")
                 print(f"[GT-STATS] Unique batch indices: {x.bbox_batch.unique().tolist()}")
                 print(f"[GT-STATS] Num graphs: {x.num_graphs}")
+                
+                # 新增: 打印每个类别的实例数量
+                if x.bbox.shape[0] > 0 and x.bbox.shape[1] >= 5:
+                    cls_counts = torch.bincount(x.bbox[:, 4].long(), minlength=2)
+                    print(f"[GT-STATS] 类别分布: 类别0={cls_counts[0].item()}, 类别1={cls_counts[1].item()}")
             
             targets = self._convert_bbox_to_fcos_format(x.bbox, x.bbox_batch, x.num_graphs)
             
@@ -465,7 +484,8 @@ class DAGR_FCOS(nn.Module):
                 for i, target in enumerate(targets):
                     print(f"  Batch {i}: {target.shape[0]} targets")
                     if target.shape[0] > 0:
-                        print(f"    Classes: {target[:, 0].unique().tolist()}")
+                        cls_counts = torch.bincount(target[:, 0].long(), minlength=2)
+                        print(f"    Classes: 类别0={cls_counts[0].item()}, 类别1={cls_counts[1].item()}")
                         print(f"    Box stats - cx: [{target[:, 1].min():.1f}, {target[:, 1].max():.1f}], "
                               f"cy: [{target[:, 2].min():.1f}, {target[:, 2].max():.1f}], "
                               f"w: [{target[:, 3].min():.1f}, {target[:, 3].max():.1f}], "
@@ -576,6 +596,8 @@ class DAGR_FCOS(nn.Module):
                         print(f"  Mean: {cls_prob.mean(dim=[0,2,3])}")
                         print(f"  Max: {cls_prob.max(dim=2)[0].max(dim=2)[0].mean(dim=0)}")
                         print(f"  # Preds > 0.5: {(cls_prob > 0.5).sum(dim=[0,2,3])}")
+                        print(f"  # Preds > 0.3: {(cls_prob > 0.3).sum(dim=[0,2,3])}")
+                        print(f"  # Preds > 0.1: {(cls_prob > 0.1).sum(dim=[0,2,3])}")
                 
                 losses = self.head.loss(cls_scores, reg_preds, centernesses, targets)
                 
@@ -664,13 +686,19 @@ class DAGR_FCOS(nn.Module):
                     print(f"  Mean: {cls_prob.mean(dim=[0,2,3])}")
                     print(f"  Max: {cls_prob.max(dim=2)[0].max(dim=2)[0].mean(dim=0)}")
                     print(f"  # Preds > 0.5: {(cls_prob > 0.5).sum(dim=[0,2,3])}")
+                    print(f"  # Preds > 0.3: {(cls_prob > 0.3).sum(dim=[0,2,3])}")
+                    print(f"  # Preds > 0.1: {(cls_prob > 0.1).sum(dim=[0,2,3])}")
                 
+                # 修改: 使用类别特定的检测阈值和NMS阈值
                 detections = self.head.get_bboxes(
                     cls_scores, 
                     reg_preds, 
                     centernesses, 
                     score_thr=self.conf_threshold,
-                    nms_thr=self.nms_threshold
+                    nms_thr=self.nms_threshold,
+                    max_num=100,
+                    score_thr_cls1=self.conf_threshold_cls1,  # 为类别1传递特定阈值
+                    nms_thr_cls1=self.nms_threshold_cls1      # 为类别1传递特定的NMS阈值
                 )
                 
                 # 打印检测结果统计，在评估阶段保留频繁打印
@@ -679,7 +707,14 @@ class DAGR_FCOS(nn.Module):
                     print(f"  Batch {batch_idx}: {det['boxes'].shape[0]} detections")
                     if det['boxes'].shape[0] > 0:
                         print(f"    Score range: [{det['scores'].min():.3f}, {det['scores'].max():.3f}]")
-                        print(f"    Class distribution: {torch.bincount(det['labels'])}")
+                        print(f"    Class distribution: {torch.bincount(det['labels'], minlength=2)}")
+                        
+                        # 新增: 按类别分组打印分数统计
+                        for cls_id in range(2):  # 假设有2个类别
+                            cls_mask = det['labels'] == cls_id
+                            if cls_mask.sum() > 0:
+                                cls_scores = det['scores'][cls_mask]
+                                print(f"    Class {cls_id} scores: min={cls_scores.min():.3f}, max={cls_scores.max():.3f}, mean={cls_scores.mean():.3f}, count={cls_mask.sum().item()}")
                         
                         # 详细打印一些检测框
                         max_boxes_to_print = min(3, det['boxes'].shape[0])
@@ -744,7 +779,7 @@ class DAGR_FCOS(nn.Module):
 
 
 
-            
+
 # import torch
 # import torch.nn as nn
 # import torch.nn.functional as F
