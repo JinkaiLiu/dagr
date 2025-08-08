@@ -231,11 +231,11 @@ class DAGR_FCOS(nn.Module):
         super().__init__()
         # 修改: 为类别1设置更低的检测阈值
         self.conf_threshold = args.score_threshold if hasattr(args, 'score_threshold') else 0.05
-        self.conf_threshold_cls1 = 0.1  # 类别1使用更低的阈值
+        self.conf_threshold_cls1 = 0.05  # 降低类别1的阈值，从0.1降到0.05
         
         self.nms_threshold = args.nms_iou_threshold if hasattr(args, 'nms_iou_threshold') else 0.6
         # 修改: 为类别1设置更宽松的NMS阈值
-        self.nms_threshold_cls1 = min(0.7, self.nms_threshold + 0.1)
+        self.nms_threshold_cls1 = min(0.8, self.nms_threshold + 0.2)  # 更宽松的NMS阈值
         
         self.height = height
         self.width = width
@@ -262,7 +262,7 @@ class DAGR_FCOS(nn.Module):
             init_prior=0.01,
             scale_exp_init=1.0,
             center_sampling=True,
-            center_radius=3.5  # 增加中心采样半径，从默认的1.5增加到3.5
+            center_radius=4.0  # 增加中心采样半径，从3.5增加到4.0
         )
 
         if self.use_image:
@@ -278,7 +278,7 @@ class DAGR_FCOS(nn.Module):
                 strides=strides,
                 use_gn=True,
                 center_sampling=True,
-                center_radius=3.5  # 保持一致的中心采样半径
+                center_radius=4.0  # 保持一致的中心采样半径
             )
 
         if "img_net_checkpoint" in args:
@@ -679,7 +679,7 @@ class DAGR_FCOS(nn.Module):
                 return empty_result
             
             try:
-                # 打印评估阶段的预测分布，在评估阶段保留频繁打印以便于调试
+                # 打印评估阶段的预测分布
                 for level_idx, cls_score in enumerate(cls_scores):
                     cls_prob = torch.sigmoid(cls_score)
                     print(f"[EVAL-CLS] Level {level_idx} classification probabilities:")
@@ -689,19 +689,30 @@ class DAGR_FCOS(nn.Module):
                     print(f"  # Preds > 0.3: {(cls_prob > 0.3).sum(dim=[0,2,3])}")
                     print(f"  # Preds > 0.1: {(cls_prob > 0.1).sum(dim=[0,2,3])}")
                 
-                # 修改: 使用类别特定的检测阈值和NMS阈值
-                detections = self.head.get_bboxes(
-                    cls_scores, 
-                    reg_preds, 
-                    centernesses, 
-                    score_thr=self.conf_threshold,
-                    nms_thr=self.nms_threshold,
-                    max_num=100,
-                    score_thr_cls1=self.conf_threshold_cls1,  # 为类别1传递特定阈值
-                    nms_thr_cls1=self.nms_threshold_cls1      # 为类别1传递特定的NMS阈值
-                )
+                # 使用类别特定的检测阈值和NMS阈值
+                try:
+                    detections = self.head.get_bboxes(
+                        cls_scores, 
+                        reg_preds, 
+                        centernesses, 
+                        score_thr=self.conf_threshold,
+                        nms_thr=self.nms_threshold,
+                        max_num=100,
+                        score_thr_cls1=self.conf_threshold_cls1,
+                        nms_thr_cls1=self.nms_threshold_cls1
+                    )
+                except Exception as e:
+                    print(f"Error in get_bboxes: {e}")
+                    device = next(self.parameters()).device
+                    detections = []
+                    for _ in range(x.num_graphs):
+                        detections.append({
+                            'boxes': torch.zeros((0, 4), device=device),
+                            'scores': torch.zeros(0, device=device),
+                            'labels': torch.zeros(0, dtype=torch.long, device=device)
+                        })
                 
-                # 打印检测结果统计，在评估阶段保留频繁打印
+                # 打印检测结果统计
                 print(f"[DETECTION-STATS] Detection results:")
                 for batch_idx, det in enumerate(detections):
                     print(f"  Batch {batch_idx}: {det['boxes'].shape[0]} detections")
@@ -709,8 +720,8 @@ class DAGR_FCOS(nn.Module):
                         print(f"    Score range: [{det['scores'].min():.3f}, {det['scores'].max():.3f}]")
                         print(f"    Class distribution: {torch.bincount(det['labels'], minlength=2)}")
                         
-                        # 新增: 按类别分组打印分数统计
-                        for cls_id in range(2):  # 假设有2个类别
+                        # 按类别分组打印分数统计
+                        for cls_id in range(2):
                             cls_mask = det['labels'] == cls_id
                             if cls_mask.sum() > 0:
                                 cls_scores = det['scores'][cls_mask]
@@ -730,7 +741,9 @@ class DAGR_FCOS(nn.Module):
                             print(f"      Det #{i}: class={cls}, score={score:.3f}, box=[{x1:.1f},{y1:.1f},{x2:.1f},{y2:.1f}], w={w:.1f}, h={h:.1f}")
                 
             except Exception as e:
-                print(f"Error in get_bboxes: {e}")
+                print(f"Error in evaluation processing: {e}")
+                import traceback
+                traceback.print_exc()
                 device = next(self.parameters()).device
                 empty_result = []
                 for _ in range(x.num_graphs):
@@ -747,19 +760,32 @@ class DAGR_FCOS(nn.Module):
                     return empty_result, targets
                 return empty_result
             
+            # 关键修复：正确的坐标转换格式
             formatted_detections = []
             for det in detections:
                 boxes = det['boxes']
                 scores = det['scores']
                 labels = det['labels']
                 
+                # 检查有无检测结果
                 if boxes.size(0) > 0:
+                    # 修复核心问题：从XYXY格式直接转换为左上角+宽高格式
                     x1, y1, x2, y2 = boxes.unbind(1)
-                    cx = (x1 + x2) / 2
-                    cy = (y1 + y2) / 2
-                    w = x2 - x1
-                    h = y2 - y1
-                    boxes = torch.stack([cx, cy, w, h], dim=1)
+                    w = x2 - x1  # 宽度
+                    h = y2 - y1  # 高度
+                    
+                    # 确保宽度和高度都是正值
+                    w = torch.clamp(w, min=1.0)
+                    h = torch.clamp(h, min=1.0)
+                    
+                    # 使用正确的格式：左上角坐标+宽高 [x1, y1, w, h]
+                    boxes = torch.stack([x1, y1, w, h], dim=1)
+                    
+                    # 为了调试，打印一些信息
+                    print(f"[BOX-FORMAT] Converting {len(boxes)} boxes to [x1, y1, w, h] format")
+                    if len(boxes) > 0:
+                        print(f"  Width range: [{w.min().item():.1f}, {w.max().item():.1f}]")
+                        print(f"  Height range: [{h.min().item():.1f}, {h.max().item():.1f}]")
                 
                 height_tensor = torch.tensor(self.height, device=boxes.device)
                 width_tensor = torch.tensor(self.width, device=boxes.device)
@@ -772,12 +798,24 @@ class DAGR_FCOS(nn.Module):
                     'width': width_tensor
                 })
             
+            # 最后的检查，确保所有框都是有效的
+            for i, det in enumerate(formatted_detections):
+                if det['boxes'].size(0) > 0:
+                    # 检查是否有任何宽度或高度小于或等于0
+                    invalid_boxes = (det['boxes'][:, 2] <= 0) | (det['boxes'][:, 3] <= 0)
+                    if invalid_boxes.any():
+                        print(f"[WARNING] Batch {i}: Found {invalid_boxes.sum().item()} invalid boxes with zero or negative width/height")
+                        # 过滤掉无效的框
+                        valid_mask = ~invalid_boxes
+                        det['boxes'] = det['boxes'][valid_mask]
+                        det['scores'] = det['scores'][valid_mask]
+                        det['labels'] = det['labels'][valid_mask]
+                        print(f"  After filtering: {det['boxes'].size(0)} valid boxes")
+            
             if return_targets and hasattr(x, 'bbox'):
                 targets = convert_to_evaluation_format(x)
                 return formatted_detections, targets
             return formatted_detections
-
-
 
 
 # import torch
