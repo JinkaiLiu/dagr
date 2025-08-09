@@ -353,25 +353,26 @@ class FCOSHead(nn.Module):
 
     def compute_centerness(self, left_right, top_bottom, epsilon=1e-6):
         """安全计算centerness，防止NaN"""
-        # 确保所有值都是正的
-        left_right = torch.clamp(left_right, min=epsilon)
-        top_bottom = torch.clamp(top_bottom, min=epsilon)
+        left_right = reg_targets[:, [0, 2]]
+        top_bottom = reg_targets[:, [1, 3]]
         
-        # 计算最小最大比
-        lr_ratio = torch.min(left_right, dim=1)[0] / torch.max(left_right, dim=1)[0]
-        tb_ratio = torch.min(top_bottom, dim=1)[0] / torch.max(top_bottom, dim=1)[0]
+        # 确保所有值都是正数
+        left_right = torch.clamp(left_right, min=1e-4)
+        top_bottom = torch.clamp(top_bottom, min=1e-4)
         
-        # 确保比值在有效范围内
-        lr_ratio = torch.clamp(lr_ratio, min=epsilon, max=1.0)
-        tb_ratio = torch.clamp(tb_ratio, min=epsilon, max=1.0)
+        # 安全计算最小值/最大值比例
+        min_left_right = torch.min(left_right, dim=1)[0]
+        max_left_right = torch.max(left_right, dim=1)[0]
+        min_top_bottom = torch.min(top_bottom, dim=1)[0]
+        max_top_bottom = torch.max(top_bottom, dim=1)[0]
         
-        # 计算centerness
-        centerness = torch.sqrt(lr_ratio * tb_ratio)
+        # 避免除以零，并确保比值在[0,1]范围内
+        left_right_ratio = torch.clamp(min_left_right / max_left_right, min=0.0, max=1.0)
+        top_bottom_ratio = torch.clamp(min_top_bottom / max_top_bottom, min=0.0, max=1.0)
         
-        # 替换任何可能的NaN或Inf
-        centerness = torch.nan_to_num(centerness, nan=0.5, posinf=0.5, neginf=0.5)
-        
-        return centerness.clamp(min=0.0, max=1.0)
+        # 计算并返回centerness
+        centerness = torch.sqrt(left_right_ratio * top_bottom_ratio)
+        return centerness
 
     def forward(self, feats, targets=None, training=False, hw=None):
         # 增加全局步数
@@ -513,478 +514,262 @@ class FCOSHead(nn.Module):
         else:
             return self.decode_outputs(cls_scores, reg_preds, centernesses)
 
-    def loss(self, cls_scores, reg_preds, centernesses, targets):
+    def loss(self, cls_scores, reg_preds, centernesses, targets, strides=None):
+        """安全的损失计算函数，确保不会产生NaN"""
+        # 检查输入是否有效
+        if not cls_scores or len(cls_scores) == 0:
+            device = next(self.parameters()).device
+            dummy_param = next(self.parameters())
+            zero_loss = dummy_param.mean() * 0
+            return {
+                'loss_cls': zero_loss,
+                'loss_reg': zero_loss,
+                'loss_ctr': zero_loss,
+                'total_loss': zero_loss
+            }
+        
         device = cls_scores[0].device
+        batch_size = cls_scores[0].shape[0]
+        strides = strides or self.strides
         
-        # 找到所有特征层中的最小批次大小
-        min_batch_size = min(cls.shape[0] for cls in cls_scores)
+        # 初始化损失
+        dummy_param = next(self.parameters())
+        cls_loss = dummy_param.new_tensor(0.0, requires_grad=True)
+        reg_loss = dummy_param.new_tensor(0.0, requires_grad=True)
+        ctr_loss = dummy_param.new_tensor(0.0, requires_grad=True)
         
-        # 准备扁平化后的预测数据
-        feature_info = []
-        flat_cls_scores = []
-        flat_reg_preds = []
-        flat_centernesses = []
+        # 统计正样本数量
+        num_pos = 0
         
-        for i, (cls, reg, ctr) in enumerate(zip(cls_scores, reg_preds, centernesses)):
-            # 裁剪到最小批次大小
-            cls = cls[:min_batch_size]
-            reg = reg[:min_batch_size] 
-            ctr = ctr[:min_batch_size]
+        # 处理每个特征层
+        for level_idx, stride in enumerate(strides):
+            if level_idx >= len(cls_scores):
+                continue
             
-            # 获取形状信息
-            B, C, H, W = cls.shape
-            stride = self.strides[i] if i < len(self.strides) else 8
+            # 获取当前特征层预测
+            cls_pred = cls_scores[level_idx]
+            reg_pred = reg_preds[level_idx]
+            centerness_pred = centernesses[level_idx]
             
-            # 将特征图重塑为批次x点x通道的形式
-            cls_flat = cls.permute(0, 2, 3, 1).reshape(B, H*W, C)
-            reg_flat = reg.permute(0, 2, 3, 1).reshape(B, H*W, 4)
-            ctr_flat = ctr.permute(0, 2, 3, 1).reshape(B, H*W, 1)
+            # 特征图大小
+            h, w = cls_pred.shape[2:]
             
-            flat_cls_scores.append(cls_flat)
-            flat_reg_preds.append(reg_flat)
-            flat_centernesses.append(ctr_flat)
+            # 生成网格点坐标
+            grid_y, grid_x = torch.meshgrid(
+                torch.arange(h, device=device),
+                torch.arange(w, device=device),
+                indexing='ij'
+            )
+            locations = torch.stack([
+                (grid_x + 0.5) * stride,
+                (grid_y + 0.5) * stride
+            ], dim=-1).view(-1, 2)  # [h*w, 2]
             
-            feature_info.append((H, W, stride))
-
-        # 合并所有特征层的预测
-        all_cls_scores = torch.cat(flat_cls_scores, dim=1)
-        all_reg_preds = torch.cat(flat_reg_preds, dim=1)
-        all_centernesses = torch.cat(flat_centernesses, dim=1)
-
-        # 在训练时打印预测框尺寸
-        if self.training:
-            # 计算预测框的宽高
-            for batch_idx in range(min_batch_size):
-                reg_pred = all_reg_preds[batch_idx]
-                if reg_pred.shape[0] > 0:  # 确保有预测
-                    pred_widths = reg_pred[:, 0] + reg_pred[:, 2]  # left + right
-                    pred_heights = reg_pred[:, 1] + reg_pred[:, 3]  # top + bottom
+            # 处理每个批次
+            for batch_idx in range(batch_size):
+                if batch_idx >= len(targets):
+                    continue
+                
+                # 获取当前批次的目标
+                batch_targets = targets[batch_idx]
+                if batch_targets.numel() == 0:
+                    continue
+                
+                # 获取目标类别和边界框
+                gt_cls = batch_targets[:, 0].long()
+                gt_bbox = batch_targets[:, 1:5]  # [cx, cy, w, h]
+                
+                # 将目标框转换为XYXY格式
+                gt_x1 = gt_bbox[:, 0] - gt_bbox[:, 2] / 2
+                gt_y1 = gt_bbox[:, 1] - gt_bbox[:, 3] / 2
+                gt_x2 = gt_bbox[:, 0] + gt_bbox[:, 2] / 2
+                gt_y2 = gt_bbox[:, 1] + gt_bbox[:, 3] / 2
+                
+                # 计算点到目标框边界的距离
+                xs, ys = locations[:, 0].unsqueeze(1), locations[:, 1].unsqueeze(1)
+                left = xs - gt_x1.unsqueeze(0)     # [num_locations, num_targets]
+                top = ys - gt_y1.unsqueeze(0)      # [num_locations, num_targets]
+                right = gt_x2.unsqueeze(0) - xs    # [num_locations, num_targets]
+                bottom = gt_y2.unsqueeze(0) - ys   # [num_locations, num_targets]
+                
+                # 计算回归目标 [num_locations, num_targets, 4]
+                reg_targets = torch.stack([left, top, right, bottom], dim=-1)
+                
+                # 确定哪些点在目标框内部
+                inside_gt_mask = reg_targets.min(dim=-1)[0] > 0  # [num_locations, num_targets]
+                
+                # 如果没有内部点，强制使用最近的点
+                if not inside_gt_mask.any():
+                    # 计算点到目标中心的距离
+                    gt_centers = torch.stack([(gt_x1 + gt_x2) / 2, (gt_y1 + gt_y2) / 2], dim=1)
+                    distances = torch.sqrt(
+                        (xs - gt_centers[:, 0].unsqueeze(0)) ** 2 + 
+                        (ys - gt_centers[:, 1].unsqueeze(0)) ** 2
+                    )
                     
-                    if self.global_step % 200 == 0:  # 减少打印频率
-                        print(f"[LEARN] Batch {batch_idx} 预测框宽高: min=({pred_widths.min().item():.4f}, {pred_heights.min().item():.4f}), "
-                              f"max=({pred_widths.max().item():.4f}, {pred_heights.max().item():.4f}), "
-                              f"mean=({pred_widths.mean().item():.4f}, {pred_heights.mean().item():.4f})")
+                    # 选择每个位置最近的目标
+                    min_dist, min_inds = distances.min(dim=1)
                     
-                    # 检查是否有固定大小的预测
-                    width_std = pred_widths.std().item()
-                    height_std = pred_heights.std().item()
-                    if width_std < 0.1 or height_std < 0.1:
-                        if self.global_step % 200 == 0:
-                            print(f"[WARNING] 预测框尺寸变化很小！width_std={width_std:.6f}, height_std={height_std:.6f}")
-
-        # 初始化损失字典
-        losses = dict(
-            loss_cls=torch.tensor(0.0, device=device),
-            loss_reg=torch.tensor(0.0, device=device),
-            loss_ctr=torch.tensor(0.0, device=device)
-        )
-        
-        # 统计变量
-        num_pos_total = 0
-        num_batches_with_pos = 0
-        B = min_batch_size
-        
-        # 记录所有正样本的统计信息，用于调试
-        all_pos_reg_targets = []
-        all_pos_centerness = []
-        all_pos_cls_scores = []
-        all_pos_pred_centerness = []
-        all_target_ious = []
-        
-        # 记录每个batch中的正样本数量
-        batch_pos_counts = []
-
-        # 处理每个批次
-        for batch_idx in range(B):
-            if batch_idx >= len(targets):
-                continue
+                    # 取最近的10%点作为强制正样本
+                    k = max(1, int(locations.size(0) * 0.1))
+                    _, topk_inds = min_dist.topk(k, largest=False)
+                    
+                    # 创建强制正样本掩码
+                    inside_gt_mask = torch.zeros_like(distances, dtype=torch.bool)
+                    for i in range(len(topk_inds)):
+                        inside_gt_mask[topk_inds[i], min_inds[topk_inds[i]]] = True
+                    
+                    print(f"[DEBUG] Forced {inside_gt_mask.sum().item()} positive samples for batch {batch_idx}")
                 
-            # 获取当前批次的GT
-            gt = targets[batch_idx]
-            
-            # 检查GT有效性
-            if gt.numel() == 0:
-                batch_pos_counts.append(0)
-                continue
+                # 跳过没有正样本的情况
+                if not inside_gt_mask.any():
+                    print(f"[WARNING] Still no positive samples for batch {batch_idx}, level {level_idx}")
+                    continue
                 
-            # 过滤无效GT
-            gt_areas = gt[:, 3] * gt[:, 4]
-            valid_mask = gt_areas > 0
-            
-            # 确保GT坐标有效
-            coord_valid = (gt[:, 1] >= 0) & (gt[:, 2] >= 0) & (gt[:, 3] > 0) & (gt[:, 4] > 0)
-            valid_mask = valid_mask & coord_valid
-            
-            gt_valid = gt[valid_mask]
-            
-            if gt_valid.numel() == 0:
-                batch_pos_counts.append(0)
-                continue
-
-            # 分离类别和边界框
-            gt_cls = gt_valid[:, 0].long()
-            gt_boxes = gt_valid[:, 1:]
-
-            # 调试信息：打印有效GT框 - 减少频率
-            if self.debug_mode and self.global_step % 200 == 0 and batch_idx == 0:
-                print(f"[DEBUG] Batch {batch_idx}: {len(gt_valid)} valid GT boxes")
-                for i, (c, box) in enumerate(zip(gt_cls, gt_boxes)):
-                    class_name = self.class_names.get(c.item(), f"class_{c.item()}")
-                    print(f"  GT #{i}: {class_name}, center=({box[0].item():.4f}, {box[1].item():.4f}), size=({box[2].item():.4f}, {box[3].item():.4f})")
-
-            # 生成每个特征层的特征点
-            points = []
-            strides_all = []
-            for level_idx, (H, W, stride) in enumerate(feature_info):
-                # 生成网格点
-                y, x = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij')
-                x = x.flatten().float() * stride + stride // 2
-                y = y.flatten().float() * stride + stride // 2
-                p = torch.stack([x, y], dim=1)
-                points.append(p)
-                strides_all.append(torch.full((len(p),), stride, device=device))
-            
-            if len(points) == 0:
-                batch_pos_counts.append(0)
-                continue
+                # 每个位置选择面积最小的目标框
+                areas = (gt_x2 - gt_x1) * (gt_y2 - gt_y1)  # [num_targets]
+                areas = areas.unsqueeze(0).expand(locations.size(0), -1)  # [num_locations, num_targets]
                 
-            # 合并所有特征层的点
-            points = torch.cat(points, dim=0)
-            strides_all = torch.cat(strides_all, dim=0)
-
-            # 获取点和GT数量
-            num_points = points.shape[0]
-            num_gts = gt_boxes.shape[0]
-
-            # GT边界框转换
-            gt_xy = gt_boxes[:, :2]
-            gt_wh = gt_boxes[:, 2:]
-            
-            # 将GT转换为XYXY格式用于目标分配
-            x1y1 = gt_xy - gt_wh / 2
-            x2y2 = gt_xy + gt_wh / 2
-            gt_area = (x2y2[:, 0] - x1y1[:, 0]) * (x2y2[:, 1] - x1y1[:, 1])
-
-            # 计算每个点到每个GT框的四个距离
-            px = points[:, 0].unsqueeze(1)
-            py = points[:, 1].unsqueeze(1)
-            l = px - x1y1[:, 0]  # 左
-            t = py - x1y1[:, 1]  # 上
-            r = x2y2[:, 0] - px  # 右
-            b = x2y2[:, 1] - py  # 下
-            reg_targets = torch.stack([l, t, r, b], dim=2)
-
-            # 判断点是否在框内（所有距离都为正）
-            inside_box = reg_targets.min(dim=2)[0] > 0
-
-            # 定义中心区域
-            center = gt_xy
-            # 使用自适应半径
-            radius_factor = 2.0  # 合理的半径因子
-            # 根据目标大小和特征层stride调整半径
-            radius = torch.max(strides_all.unsqueeze(1), gt_wh.min(dim=1)[0] / 4.0) * radius_factor
-            # 计算每个点到每个GT中心的距离
-            center_x = torch.abs(px - center[:, 0])
-            center_y = torch.abs(py - center[:, 1])
-            # 判断点是否在中心区域内
-            center_dist = (center_x < radius) & (center_y < radius)
-            
-            # 计算点到框的IoU - 修复版本
-            ious = torch.zeros((num_points, num_gts), device=device)
-            for i in range(num_gts):
-                # 为每个点创建固定大小的框
-                point_size = strides_all.clone()  # 使用特征层stride作为点框大小
-                point_boxes = torch.zeros((num_points, 4), device=device)
-                point_boxes[:, 0] = points[:, 0] - point_size / 2  # 左
-                point_boxes[:, 1] = points[:, 1] - point_size / 2  # 上
-                point_boxes[:, 2] = points[:, 0] + point_size / 2  # 右
-                point_boxes[:, 3] = points[:, 1] + point_size / 2  # 下
+                # 复制areas以避免修改原始张量
+                areas_for_min = areas.clone()
+                areas_for_min[~inside_gt_mask] = float('inf')  # 只考虑inside_flag=True的区域
+                min_area_inds = areas_for_min.argmin(dim=1)    # [num_locations]
                 
-                # 计算每个点框与当前GT框的IoU
-                gt_box = torch.cat([x1y1[i:i+1], x2y2[i:i+1]], dim=1)  # [1, 4]
+                # 正样本掩码
+                pos_mask = inside_gt_mask.any(dim=1)  # [num_locations]
+                pos_count = pos_mask.sum().item()
+                if pos_count == 0:
+                    print(f"[WARNING] No positive samples after area filtering for batch {batch_idx}")
+                    continue
+                    
+                print(f"[DEBUG] Found {pos_count} positive samples for batch {batch_idx}, level {level_idx}")
+                num_pos += pos_count
+                
+                # 获取每个正样本位置对应的目标框
+                pos_inds = torch.nonzero(pos_mask).squeeze(1)  # [num_pos]
+                target_inds = min_area_inds[pos_mask]  # [num_pos]
+                
+                # 获取正样本的回归目标
+                pos_reg_targets = reg_targets[pos_inds, target_inds]  # [num_pos, 4]
+                
+                # 安全计算centerness目标
+                centerness_targets = self._calculate_centerness(pos_reg_targets)
+                
+                # 获取预测值
+                cls_pred_flat = cls_pred[batch_idx].permute(1, 2, 0).reshape(-1, self.num_classes)
+                reg_pred_flat = reg_pred[batch_idx].permute(1, 2, 0).reshape(-1, 4)
+                centerness_pred_flat = centerness_pred[batch_idx].permute(1, 2, 0).reshape(-1)
+                
+                # 获取正样本的预测
+                pos_cls_preds = cls_pred_flat[pos_inds]
+                pos_reg_preds = reg_pred_flat[pos_inds]
+                pos_centerness_preds = centerness_pred_flat[pos_inds]
+                
+                # 创建分类目标
+                pos_cls_targets = torch.zeros_like(pos_cls_preds)
+                pos_cls_targets[torch.arange(len(pos_inds)), gt_cls[target_inds]] = 1.0
+                
+                # 计算分类损失（带有异常值检测）
                 try:
-                    # 使用torchvision的box_iou函数
-                    box_ious = ops.box_iou(point_boxes, gt_box)
-                    ious[:, i] = box_ious.squeeze(1)
+                    cls_loss_batch = F.binary_cross_entropy_with_logits(
+                        pos_cls_preds, pos_cls_targets, reduction='none'
+                    )
+                    
+                    # 检查分类损失是否有NaN
+                    if torch.isnan(cls_loss_batch).any():
+                        print(f"[WARNING] NaN in cls_loss_batch, replacing with zeros")
+                        cls_loss_batch = torch.where(torch.isnan(cls_loss_batch), torch.zeros_like(cls_loss_batch), cls_loss_batch)
+                    
+                    cls_loss = cls_loss + cls_loss_batch.sum()
                 except Exception as e:
-                    # 出错时使用零值
-                    if self.global_step % 200 == 0:
-                        print(f"[WARNING] IoU计算错误: {e}")
-                    ious[:, i] = torch.zeros(num_points, device=device)
-
-            # 调试IoU计算 - 减少频率
-            if self.debug_mode and self.global_step % 200 == 0 and batch_idx == 0:
-                print(f"[DEBUG] Points: {num_points}, GT boxes: {num_gts}")
-                print(f"[DEBUG] IoU shape: {ious.shape}")
-                if num_gts > 0 and num_points > 0:
-                    print(f"[DEBUG] IoU stats: min={ious.min().item():.4f}, max={ious.max().item():.4f}, mean={ious.mean().item():.4f}")
-
-            # 结合多个条件确定正样本
-            # 使用更低的IoU阈值以获取更多正样本
-            high_iou = ious > 0.20
-            
-            # 正样本条件：在框内并且(高IoU或在中心区域)
-            is_pos = inside_box & (high_iou | center_dist)
-            
-            # 如果某个GT没有正样本，尝试放宽条件
-            num_assigned_per_gt = is_pos.sum(0)
-            gt_no_pos = num_assigned_per_gt == 0
-            
-            if gt_no_pos.any():
-                # 对于没有正样本的GT，找到最高IoU的点作为正样本
-                for gt_idx in torch.where(gt_no_pos)[0]:
-                    if inside_box[:, gt_idx].sum() > 0:
-                        # 在框内找最大IoU
-                        max_iou, max_idx = ious[inside_box[:, gt_idx], gt_idx].max(dim=0)
-                        real_idx = torch.where(inside_box[:, gt_idx])[0][max_idx]
-                        is_pos[real_idx, gt_idx] = True
-                    else:
-                        # 如果没有点在框内，就找最近的点
-                        # 计算点到框中心的距离
-                        dist_to_center = torch.sqrt(
-                            (points[:, 0] - gt_xy[gt_idx, 0])**2 + 
-                            (points[:, 1] - gt_xy[gt_idx, 1])**2
-                        )
-                        min_dist, min_idx = dist_to_center.min(dim=0)
-                        is_pos[min_idx, gt_idx] = True
-
-            # 为每个点分配最小面积的GT
-            gt_area_expanded = gt_area.unsqueeze(0).repeat(num_points, 1)
-            gt_area_expanded[~is_pos] = float('inf')
-            min_area, min_inds = gt_area_expanded.min(dim=1)
-            pos_mask = min_area < float('inf')
-            num_pos = pos_mask.sum().item()
-            
-            batch_pos_counts.append(num_pos)
-            
-            if num_pos == 0:
-                continue
-
-            num_batches_with_pos += 1
-            matched_inds = min_inds[pos_mask]
-            matched_boxes = gt_boxes[matched_inds]
-            matched_cls = gt_cls[matched_inds]
-
-            # 创建分类目标
-            cls_target = torch.zeros_like(all_cls_scores[batch_idx])
-            cls_target[pos_mask, matched_cls] = 1.0
-            
-            # 使用改进的Focal Loss进行分类
-            loss_cls = self.focal_loss(all_cls_scores[batch_idx], cls_target, alpha=0.25, gamma=2.0) / max(num_pos, 1)
-            
-            # 计算回归损失
-            matched_x1y1 = matched_boxes[:, :2] - matched_boxes[:, 2:] / 2
-            matched_x2y2 = matched_boxes[:, :2] + matched_boxes[:, 2:] / 2
-            matched_l = points[pos_mask][:, 0] - matched_x1y1[:, 0]
-            matched_t = points[pos_mask][:, 1] - matched_x1y1[:, 1]
-            matched_r = matched_x2y2[:, 0] - points[pos_mask][:, 0]
-            matched_b = matched_x2y2[:, 1] - points[pos_mask][:, 1]
-            reg_target = torch.stack([matched_l, matched_t, matched_r, matched_b], dim=1)
-            
-            # 保存回归目标以进行调试
-            all_pos_reg_targets.append(reg_target)
-            
-            # 获取回归预测
-            reg_pred = all_reg_preds[batch_idx][pos_mask]
-            
-            # 过滤无效回归目标
-            valid_reg_mask = (reg_target > 0).all(dim=1)
-            if valid_reg_mask.sum() > 0:
-                # 获取有效的预测和目标回归值
-                valid_pred_boxes = reg_pred[valid_reg_mask]  # 预测的ltrb
-                valid_target_boxes = reg_target[valid_reg_mask]  # 目标的ltrb
+                    print(f"[ERROR] Exception in classification loss: {e}")
+                    # 继续处理其他损失
                 
-                # 使用GIoU Loss计算回归损失
-                iou_loss = self.giou_loss(
-                    valid_pred_boxes,  # 预测的边界框
-                    valid_target_boxes,  # 目标边界框
-                    reduction='mean'
-                )
-
-                # 添加宽高平衡机制
-                if valid_reg_mask.sum() > 0:
-                    # 计算预测和目标的宽高
-                    pred_widths = valid_pred_boxes[:, 0] + valid_pred_boxes[:, 2]  # 左+右=宽
-                    pred_heights = valid_pred_boxes[:, 1] + valid_pred_boxes[:, 3]  # 上+下=高
-                    target_widths = valid_target_boxes[:, 0] + valid_target_boxes[:, 2]
-                    target_heights = valid_target_boxes[:, 1] + valid_target_boxes[:, 3]
-                    
-                    # 计算宽高比例
-                    width_ratio = pred_widths / (target_widths + 1e-7)
-                    height_ratio = pred_heights / (target_heights + 1e-7)
-                    
-                    # 鼓励宽高比例接近1.0
-                    width_loss = F.l1_loss(width_ratio, torch.ones_like(width_ratio))
-                    height_loss = F.l1_loss(height_ratio, torch.ones_like(height_ratio))
-                    
-                    # 添加到回归损失中，权重较小以不干扰主要学习
-                    aspect_loss = (width_loss + height_loss) * 0.1
-                    iou_loss = iou_loss + aspect_loss
-                    
-                    # 可选：记录宽高平衡损失，用于监控
-                    if self.global_step % 200 == 0:
-                        print(f"[LEARN] 宽高平衡损失: 宽={width_loss.item():.4f}, 高={height_loss.item():.4f}, 总={aspect_loss.item():.4f}")
-                
-                # 在GIoU损失计算后添加
-                if self.global_step % 200 == 0:
-                    # 计算预测和目标的宽高
-                    pred_widths = valid_pred_boxes[:, 0] + valid_pred_boxes[:, 2]  # 左+右
-                    pred_heights = valid_pred_boxes[:, 1] + valid_pred_boxes[:, 3]  # 上+下
-                    
-                    target_widths = valid_target_boxes[:, 0] + valid_target_boxes[:, 2]
-                    target_heights = valid_target_boxes[:, 1] + valid_target_boxes[:, 3]
-                    
-                    # 计算比例 - 这是关键指标
-                    width_ratio = pred_widths.mean() / target_widths.mean()
-                    height_ratio = pred_heights.mean() / target_heights.mean()
-                    
-                    print(f"[LEARN] Batch {batch_idx}: 尺寸比例: 宽={width_ratio.item():.4f}, 高={height_ratio.item():.4f}")
-                    print(f"[LEARN] 预测尺寸: 宽={pred_widths.mean().item():.2f}, 高={pred_heights.mean().item():.2f} vs 目标尺寸: 宽={target_widths.mean().item():.2f}, 高={target_heights.mean().item():.2f}")
-                
-                # 计算IoU用于监控
-                pred_boxes = reg_pred[valid_reg_mask]
-                target_boxes = reg_target[valid_reg_mask]
-                
-                # 计算完整的IoU - 将ltrb格式转换为xyxy格式
-                pred_points = points[pos_mask][valid_reg_mask]
-                pred_x1 = pred_points[:, 0] - pred_boxes[:, 0]
-                pred_y1 = pred_points[:, 1] - pred_boxes[:, 1]
-                pred_x2 = pred_points[:, 0] + pred_boxes[:, 2]
-                pred_y2 = pred_points[:, 1] + pred_boxes[:, 3]
-                pred_xyxy = torch.stack([pred_x1, pred_y1, pred_x2, pred_y2], dim=1)
-                
-                target_points = points[pos_mask][valid_reg_mask]
-                target_x1 = target_points[:, 0] - target_boxes[:, 0]
-                target_y1 = target_points[:, 1] - target_boxes[:, 1]
-                target_x2 = target_points[:, 0] + target_boxes[:, 2]
-                target_y2 = target_points[:, 1] + target_boxes[:, 3]
-                target_xyxy = torch.stack([target_x1, target_y1, target_x2, target_y2], dim=1)
-                
-                # 使用box_iou计算IoU
+                # 计算回归损失
                 try:
-                    ious = ops.box_iou(pred_xyxy, target_xyxy)
-                    diag_ious = torch.diag(ious)
-                    all_target_ious.append(diag_ious)
+                    # 将距离转换为边界框
+                    pred_boxes = self._distance2bbox(locations[pos_inds], pos_reg_preds)
+                    target_boxes = self._distance2bbox(locations[pos_inds], pos_reg_targets)
                     
-                    # 如果有计算IoU值，也打印出来
-                    if self.global_step % 200 == 0:
-                        mean_iou = diag_ious.mean().item()
-                        max_iou = diag_ious.max().item()
-                        over_05 = (diag_ious > 0.5).float().mean().item()
-                        
-                        print(f"[LEARN] IoU: 平均={mean_iou:.4f}, 最大={max_iou:.4f}, >0.5比例={over_05:.4f}")
+                    # 打印边界框统计信息
+                    print(f"[DEBUG] pred_boxes stats: min={pred_boxes.min().item():.4f}, max={pred_boxes.max().item():.4f}")
+                    print(f"[DEBUG] target_boxes stats: min={target_boxes.min().item():.4f}, max={target_boxes.max().item():.4f}")
+                    
+                    # 使用SmoothL1Loss
+                    l1_loss = F.smooth_l1_loss(pred_boxes, target_boxes, reduction='none')
+                    
+                    # 检查l1_loss是否有NaN
+                    if torch.isnan(l1_loss).any() or torch.isinf(l1_loss).any():
+                        print(f"[WARNING] NaN or Inf in l1_loss, replacing with zeros")
+                        l1_loss = torch.where(torch.isnan(l1_loss) | torch.isinf(l1_loss), torch.zeros_like(l1_loss), l1_loss)
+                    
+                    # 计算IoU损失
+                    iou = self._bbox_overlaps(pred_boxes, target_boxes)
+                    iou_loss = 1 - iou
+                    
+                    # 检查iou_loss是否有NaN
+                    if torch.isnan(iou_loss).any():
+                        print(f"[WARNING] NaN in iou_loss, replacing with zeros")
+                        iou_loss = torch.where(torch.isnan(iou_loss), torch.zeros_like(iou_loss), iou_loss)
+                    
+                    # 使用centerness加权的损失
+                    centerness_weights = centerness_targets.clamp(min=1e-6)  # 确保权重不为零
+                    
+                    # 混合回归损失
+                    l1_weight = 1.0
+                    iou_weight = 0.5
+                    
+                    reg_loss = reg_loss + (l1_loss.sum(dim=1) * centerness_weights).sum() * l1_weight
+                    reg_loss = reg_loss + (iou_loss * centerness_weights).sum() * iou_weight
                 except Exception as e:
-                    if self.global_step % 200 == 0:
-                        print(f"[WARNING] Computing IoU for monitoring failed: {e}")
-            else:
-                iou_loss = torch.tensor(0.0, device=device)
-
-            # 计算centerness损失
-            left_right = reg_target[:, [0, 2]]
-            top_bottom = reg_target[:, [1, 3]]
-            
-            # 使用安全的centerness计算函数
-            centerness = self.compute_centerness(left_right, top_bottom)
-            pred_ctr = all_centernesses[batch_idx][pos_mask].squeeze(-1)
-            
-            # 保存centerness值用于调试
-            all_pos_centerness.append(centerness)
-            all_pos_pred_centerness.append(pred_ctr)
-            all_pos_cls_scores.append(all_cls_scores[batch_idx][pos_mask])
-            
-            # 使用BCE损失计算centerness损失
-            loss_ctr = F.binary_cross_entropy_with_logits(
-                pred_ctr, centerness, reduction='mean')
-
-            # 累加损失
-            losses['loss_cls'] += loss_cls
-            losses['loss_reg'] += iou_loss
-            losses['loss_ctr'] += loss_ctr
-            num_pos_total += num_pos
-
-        # 每200步打印一次详细的调试信息
-        if self.debug_mode and self.global_step % 200 == 0:
-            pos_count_str = ", ".join([f"{cnt}" for cnt in batch_pos_counts])
-            print(f"[DEBUG] Positive samples per batch: [{pos_count_str}], total: {num_pos_total}")
-            
-            # 分析回归目标分布
-            if all_pos_reg_targets:
-                all_targets = torch.cat(all_pos_reg_targets, dim=0)
-                print(f"[DEBUG] Regression targets: min={all_targets.min().item():.4f}, max={all_targets.max().item():.4f}, mean={all_targets.mean().item():.4f}")
+                    print(f"[ERROR] Exception in regression loss: {e}")
+                    import traceback
+                    traceback.print_exc()
                 
-                # 分析left/right和top/bottom比例
-                lr_ratio = torch.min(all_targets[:, [0, 2]], dim=1)[0] / torch.max(all_targets[:, [0, 2]], dim=1)[0]
-                tb_ratio = torch.min(all_targets[:, [1, 3]], dim=1)[0] / torch.max(all_targets[:, [1, 3]], dim=1)[0]
-                
-                print(f"[DEBUG] LR ratio: min={lr_ratio.min().item():.4f}, max={lr_ratio.max().item():.4f}, mean={lr_ratio.mean().item():.4f}")
-                print(f"[DEBUG] TB ratio: min={tb_ratio.min().item():.4f}, max={tb_ratio.max().item():.4f}, mean={tb_ratio.mean().item():.4f}")
-            
-            # 分析centerness分布
-            if all_pos_centerness:
-                all_centerness = torch.cat(all_pos_centerness, dim=0)
-                all_pred_centerness = torch.cat(all_pos_pred_centerness, dim=0)
-                
-                print(f"[DEBUG] GT Centerness: min={all_centerness.min().item():.4f}, max={all_centerness.max().item():.4f}, mean={all_centerness.mean().item():.4f}")
-                print(f"[DEBUG] Pred Centerness: min={torch.sigmoid(all_pred_centerness).min().item():.4f}, max={torch.sigmoid(all_pred_centerness).max().item():.4f}, mean={torch.sigmoid(all_pred_centerness).mean().item():.4f}")
-            
-            # 分析IoU分布
-            if all_target_ious:
-                all_ious = torch.cat(all_target_ious, dim=0)
-                print(f"[DEBUG] Target IoUs: min={all_ious.min().item():.4f}, max={all_ious.max().item():.4f}, mean={all_ious.mean().item():.4f}")
-                print(f"[DEBUG] IoU > 0.5: {(all_ious > 0.5).float().mean().item():.4f}, IoU > 0.7: {(all_ious > 0.7).float().mean().item():.4f}")
-            
-            # 分析分类分数分布
-            if all_pos_cls_scores:
-                matched_cls_scores = torch.cat([s.max(dim=1)[0] for s in all_pos_cls_scores], dim=0)
-                print(f"[DEBUG] Pos Cls Scores: min={matched_cls_scores.min().item():.4f}, max={matched_cls_scores.max().item():.4f}, mean={matched_cls_scores.mean().item():.4f}")
-                print(f"[DEBUG] Sigmoid(Cls) > 0.5: {(torch.sigmoid(matched_cls_scores) > 0.5).float().mean().item():.4f}")
-
-        if num_pos_total > 0 and self.global_step % 200 == 0:
-            print(f"[TRAIN] Found {num_pos_total} positive samples across batch")
+                # 计算centerness损失
+                try:
+                    ctr_loss_batch = F.binary_cross_entropy_with_logits(
+                        pos_centerness_preds, centerness_targets, reduction='none'
+                    )
+                    
+                    # 检查centerness损失是否有NaN
+                    if torch.isnan(ctr_loss_batch).any():
+                        print(f"[WARNING] NaN in ctr_loss_batch, replacing with zeros")
+                        ctr_loss_batch = torch.where(torch.isnan(ctr_loss_batch), torch.zeros_like(ctr_loss_batch), ctr_loss_batch)
+                    
+                    ctr_loss = ctr_loss + ctr_loss_batch.sum()
+                except Exception as e:
+                    print(f"[ERROR] Exception in centerness loss: {e}")
         
         # 平均损失
-        for k in losses:
-            losses[k] = losses[k] / max(num_batches_with_pos, 1)
+        num_pos = max(1, num_pos)
+        cls_loss = cls_loss / num_pos
+        reg_loss = reg_loss / num_pos
+        ctr_loss = ctr_loss / num_pos
         
-        # 计算总损失 - 应用权重系数
-        weighted_cls_loss = self.cls_factor * losses['loss_cls']
-        weighted_reg_loss = self.reg_factor * losses['loss_reg'] 
-        weighted_ctr_loss = self.ctr_factor * losses['loss_ctr']
+        # 检查最终损失是否有NaN
+        if torch.isnan(cls_loss):
+            print(f"[WARNING] Final cls_loss is NaN, replacing with zero")
+            cls_loss = torch.zeros_like(cls_loss)
+        if torch.isnan(reg_loss):
+            print(f"[WARNING] Final reg_loss is NaN, replacing with zero")
+            reg_loss = torch.zeros_like(reg_loss)
+        if torch.isnan(ctr_loss):
+            print(f"[WARNING] Final ctr_loss is NaN, replacing with zero")
+            ctr_loss = torch.zeros_like(ctr_loss)
         
-        # 使用加权损失计算总损失
-        losses['total_loss'] = weighted_cls_loss + weighted_reg_loss + weighted_ctr_loss
+        # 确保所有损失都有梯度
+        total_loss = cls_loss + reg_loss + ctr_loss
         
-        # 记录原始损失和加权损失，用于调试
-        losses['weighted_cls_loss'] = weighted_cls_loss
-        losses['weighted_reg_loss'] = weighted_reg_loss 
-        losses['weighted_ctr_loss'] = weighted_ctr_loss
+        # 打印损失信息
+        print(f"[DEBUG] Loss breakdown - cls: {cls_loss.item():.4f}, reg: {reg_loss.item():.4f}, ctr: {ctr_loss.item():.4f}, total: {total_loss.item():.4f}")
         
-        # 记录损失权重比例
-        total_weight = self.cls_factor + self.reg_factor + self.ctr_factor
-        losses['cls_weight_ratio'] = self.cls_factor / total_weight
-        losses['reg_weight_ratio'] = self.reg_factor / total_weight
-        losses['ctr_weight_ratio'] = self.ctr_factor / total_weight
-        
-        # 记录损失占比
-        total_weighted_loss = weighted_cls_loss + weighted_reg_loss + weighted_ctr_loss
-        if total_weighted_loss > 0:
-            losses['cls_loss_ratio'] = weighted_cls_loss / total_weighted_loss
-            losses['reg_loss_ratio'] = weighted_reg_loss / total_weighted_loss
-            losses['ctr_loss_ratio'] = weighted_ctr_loss / total_weighted_loss
-        
-        # 打印损失权重信息
-        if self.global_step % 200 == 0:
-            print(f"[LOSS WEIGHTS] cls:{self.cls_factor}, reg:{self.reg_factor}, ctr:{self.ctr_factor}")
-            print(f"[WEIGHTED LOSS] cls:{weighted_cls_loss.item():.4f}, reg:{weighted_reg_loss.item():.4f}, ctr:{weighted_ctr_loss.item():.4f}")
-            # 在计算总损失后添加
-            total_loss_value = losses['total_loss'].item()
-            cls_loss_value = losses['loss_cls'].item()
-            reg_loss_value = losses['loss_reg'].item()
-            ctr_loss_value = losses['loss_ctr'].item()
-
-            print(f"[LEARN] 损失: 总={total_loss_value:.4f}, 分类={cls_loss_value:.4f}, 回归={reg_loss_value:.4f}, 中心度={ctr_loss_value:.4f}")
-        
-        return losses
+        return {
+            'loss_cls': cls_loss,
+            'loss_reg': reg_loss,
+            'loss_ctr': ctr_loss,
+            'total_loss': total_loss
+        }
 
     def decode_outputs(self, cls_scores, reg_preds, centernesses):
         if len(cls_scores) == 0:
