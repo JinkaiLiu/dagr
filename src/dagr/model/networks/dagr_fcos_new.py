@@ -818,6 +818,1022 @@ class DAGR_FCOS(nn.Module):
             return formatted_detections
 
 
+
+#三层特征金字塔 stride 4 8 16
+
+# import torch
+# import torch.nn as nn
+# import torch.nn.functional as F
+# import math
+
+# from torch_geometric.data import Data
+# from dagr.model.networks.net import Net
+# from dagr.model.networks.fcos_head import FCOSHead
+# from dagr.model.utils import (
+#     convert_to_training_format,
+#     convert_to_evaluation_format,
+#     init_subnetwork
+# )
+
+
+# class DebugLogger:
+#     def __init__(self, print_interval=200):
+#         self.print_interval = print_interval
+#         self.iteration = 0
+#         self.feature_stats_printed = False
+#         self.stats = {
+#             'feature_shapes': [],
+#             'reg_pred_raw': {'min': [], 'max': [], 'mean': []},
+#             'reg_pred_scaled': {'min': [], 'max': [], 'mean': []},
+#             'pred_boxes': {'min': [], 'max': []},
+#             'target_boxes': {'min': [], 'max': []}
+#         }
+#         self.pos_samples_count = []
+#         self.cls_distribution = {}
+    
+#     def log_feature_shapes(self, features_unpacked):
+#         if not self.feature_stats_printed:
+#             self.stats['feature_shapes'] = [f.shape for f in features_unpacked]
+#             self.feature_stats_printed = True
+    
+#     def log_reg_pred(self, raw_pred, scaled_pred):
+#         self.stats['reg_pred_raw']['min'].append(raw_pred.min().item())
+#         self.stats['reg_pred_raw']['max'].append(raw_pred.max().item())
+#         self.stats['reg_pred_raw']['mean'].append(raw_pred.mean().item())
+        
+#         self.stats['reg_pred_scaled']['min'].append(scaled_pred.min().item())
+#         self.stats['reg_pred_scaled']['max'].append(scaled_pred.max().item())
+#         self.stats['reg_pred_scaled']['mean'].append(scaled_pred.mean().item())
+    
+#     def log_boxes(self, pred_boxes, target_boxes):
+#         if pred_boxes.numel() > 0:
+#             self.stats['pred_boxes']['min'].append(pred_boxes.min().item())
+#             self.stats['pred_boxes']['max'].append(pred_boxes.max().item())
+        
+#         if target_boxes.numel() > 0:
+#             self.stats['target_boxes']['min'].append(target_boxes.min().item())
+#             self.stats['target_boxes']['max'].append(target_boxes.max().item())
+    
+#     def log_pos_samples(self, num_pos):
+#         self.pos_samples_count.append(num_pos)
+    
+#     def log_cls_distribution(self, gt_cls):
+#         for cls_id in gt_cls.unique():
+#             cls_id = cls_id.item()
+#             count = (gt_cls == cls_id).sum().item()
+#             if cls_id not in self.cls_distribution:
+#                 self.cls_distribution[cls_id] = []
+#             self.cls_distribution[cls_id].append(count)
+    
+#     def log_detailed_box_info(self, gt_boxes, pred_boxes=None, batch_idx=0, max_boxes=5):
+#         if self.iteration % self.print_interval != 0:
+#             return
+            
+#         print(f"[BOX-INFO] Batch {batch_idx} GT boxes details:")
+#         num_boxes = min(gt_boxes.shape[0], max_boxes)
+#         for i in range(num_boxes):
+#             box = gt_boxes[i]
+#             if box.shape[0] >= 5:
+#                 cls_id = box[0].item() if box.shape[0] > 4 else -1
+#                 cx, cy, w, h = box[1:5].tolist()
+#                 print(f"  GT[{i}]: cls={cls_id}, cx={cx:.1f}, cy={cy:.1f}, w={w:.1f}, h={h:.1f}, area={w*h:.1f}")
+        
+#         if pred_boxes is not None and pred_boxes.numel() > 0:
+#             print(f"[BOX-INFO] Batch {batch_idx} Predicted boxes details:")
+#             num_pred = min(pred_boxes.shape[0], max_boxes)
+#             for i in range(num_pred):
+#                 box = pred_boxes[i]
+#                 if len(box) >= 5:
+#                     cls_id = box[0].item()
+#                     score = box[1].item() if len(box) > 5 else 1.0
+#                     cx, cy, w, h = box[2:6].tolist() if len(box) > 5 else box[1:5].tolist()
+#                     print(f"  PRED[{i}]: cls={cls_id}, score={score:.2f}, cx={cx:.1f}, cy={cy:.1f}, w={w:.1f}, h={h:.1f}, area={w*h:.1f}")
+    
+#     def log_iteration(self):
+#         self.iteration += 1
+        
+#         if self.iteration % self.print_interval == 0:
+#             self._print_stats()
+#             self._reset_stats()
+    
+#     def _print_stats(self):
+#         if self.stats['feature_shapes']:
+#             print(f"[DEBUG-{self.iteration}] Feature shapes: {self.stats['feature_shapes']}")
+        
+#         reg_raw_min = sum(self.stats['reg_pred_raw']['min']) / len(self.stats['reg_pred_raw']['min']) if self.stats['reg_pred_raw']['min'] else float('nan')
+#         reg_raw_max = sum(self.stats['reg_pred_raw']['max']) / len(self.stats['reg_pred_raw']['max']) if self.stats['reg_pred_raw']['max'] else float('nan')
+#         reg_raw_mean = sum(self.stats['reg_pred_raw']['mean']) / len(self.stats['reg_pred_raw']['mean']) if self.stats['reg_pred_raw']['mean'] else float('nan')
+        
+#         reg_scaled_min = sum(self.stats['reg_pred_scaled']['min']) / len(self.stats['reg_pred_scaled']['min']) if self.stats['reg_pred_scaled']['min'] else float('nan')
+#         reg_scaled_max = sum(self.stats['reg_pred_scaled']['max']) / len(self.stats['reg_pred_scaled']['max']) if self.stats['reg_pred_scaled']['max'] else float('nan')
+#         reg_scaled_mean = sum(self.stats['reg_pred_scaled']['mean']) / len(self.stats['reg_pred_scaled']['mean']) if self.stats['reg_pred_scaled']['mean'] else float('nan')
+        
+#         if not math.isnan(reg_raw_min):
+#             print(f"[DEBUG-{self.iteration}] Reg pred raw stats: min={reg_raw_min:.4f}, max={reg_raw_max:.4f}, mean={reg_raw_mean:.4f}")
+        
+#         if not math.isnan(reg_scaled_min):
+#             print(f"[DEBUG-{self.iteration}] Reg pred after scale exp: min={reg_scaled_min:.4f}, max={reg_scaled_max:.4f}, mean={reg_scaled_mean:.4f}")
+        
+#         pred_boxes_min = sum(self.stats['pred_boxes']['min']) / len(self.stats['pred_boxes']['min']) if self.stats['pred_boxes']['min'] else float('nan')
+#         pred_boxes_max = sum(self.stats['pred_boxes']['max']) / len(self.stats['pred_boxes']['max']) if self.stats['pred_boxes']['max'] else float('nan')
+        
+#         target_boxes_min = sum(self.stats['target_boxes']['min']) / len(self.stats['target_boxes']['min']) if self.stats['target_boxes']['min'] else float('nan')
+#         target_boxes_max = sum(self.stats['target_boxes']['max']) / len(self.stats['target_boxes']['max']) if self.stats['target_boxes']['max'] else float('nan')
+        
+#         if not math.isnan(pred_boxes_min):
+#             print(f"[DEBUG-{self.iteration}] Pred boxes stats: min={pred_boxes_min:.4f}, max={pred_boxes_max:.4f}")
+        
+#         if not math.isnan(target_boxes_min):
+#             print(f"[DEBUG-{self.iteration}] Target boxes stats: min={target_boxes_min:.4f}, max={target_boxes_max:.4f}")
+        
+#         avg_pos_samples = sum(self.pos_samples_count) / len(self.pos_samples_count) if self.pos_samples_count else 0
+#         print(f"[DEBUG-{self.iteration}] Average positive samples per batch: {avg_pos_samples:.2f}")
+        
+#         print(f"[DEBUG-{self.iteration}] Class distribution:")
+#         for cls_id, counts in self.cls_distribution.items():
+#             avg_count = sum(counts) / len(counts)
+#             print(f"  Class {cls_id}: avg {avg_count:.2f} instances per batch")
+    
+#     def _reset_stats(self):
+#         for stat_type in ['reg_pred_raw', 'reg_pred_scaled', 'pred_boxes', 'target_boxes']:
+#             for metric in self.stats[stat_type]:
+#                 self.stats[stat_type][metric] = []
+#         self.pos_samples_count = []
+#         self.cls_distribution = {}
+
+
+# def unpack_fused_features(fused_feat, debug_logger=None):
+#     features_tensor = []
+#     verbose = debug_logger is None or (debug_logger.iteration <= 1 or debug_logger.iteration % 200 == 0)
+    
+#     if verbose:
+#         print(f"[DEBUG] unpack_fused_features: received {len(fused_feat)} features")
+    
+#     for i, f in enumerate(fused_feat):
+#         try:
+#             if isinstance(f, list):
+#                 if verbose:
+#                     print(f"[DEBUG] Feature {i} is a list with {len(f)} elements")
+#                     print(f"[DEBUG] List contents types: {[type(item) for item in f]}")
+                
+#                 if len(f) > 0 and all(isinstance(item, torch.Tensor) for item in f):
+#                     if verbose:
+#                         print(f"[DEBUG] All list elements are tensors, shapes: {[item.shape for item in f]}")
+                    
+#                     if f[0].dim() == 4:
+#                         features_tensor.append(f[0])
+#                         if len(f) > 1 and f[1].dim() == 4:
+#                             features_tensor.append(f[1])
+#                         if verbose:
+#                             print(f"[DEBUG] Added 4D tensor from list with shape: {f[0].shape}")
+#                     elif f[0].dim() == 3:
+#                         features_tensor.append(f[0].unsqueeze(0))
+#                         if len(f) > 1 and f[1].dim() == 3:
+#                             features_tensor.append(f[1].unsqueeze(0))
+#                         if verbose:
+#                             print(f"[DEBUG] Added 3D tensor from list with shape: {f[0].unsqueeze(0).shape}")
+#                     elif f[0].dim() == 2:
+#                         if len(f) > 1 and f[1].numel() == 2:
+#                             try:
+#                                 height, width = f[1].tolist()
+#                                 if verbose:
+#                                     print(f"[DEBUG] Found height and width in list: {height}x{width}")
+                                
+#                                 nodes = f[0]
+#                                 if nodes.shape[0] * nodes.shape[1] == height * width:
+#                                     reshaped = nodes.reshape(nodes.shape[0], height, width)
+#                                 else:
+#                                     if nodes.shape[0] > height * width:
+#                                         nodes = nodes[:height * width]
+#                                     elif nodes.shape[0] < height * width:
+#                                         padded = torch.zeros(height * width, nodes.shape[1], device=nodes.device)
+#                                         padded[:nodes.shape[0]] = nodes
+#                                         nodes = padded
+                                    
+#                                     reshaped = nodes.reshape(height, width, nodes.shape[1]).permute(2, 0, 1)
+                                
+#                                 features_tensor.append(reshaped.unsqueeze(0))
+#                                 if verbose:
+#                                     print(f"[DEBUG] Added reshaped tensor with shape: {reshaped.unsqueeze(0).shape}")
+#                             except Exception as e:
+#                                 if verbose:
+#                                     print(f"[ERROR] Failed to reshape tensor using list dimensions: {e}")
+#                                 nodes = f[0]
+#                                 sqrt_nodes = int(math.sqrt(nodes.shape[0]))
+#                                 if sqrt_nodes * sqrt_nodes == nodes.shape[0]:
+#                                     reshaped = nodes.reshape(sqrt_nodes, sqrt_nodes, nodes.shape[1]).permute(2, 0, 1)
+#                                     features_tensor.append(reshaped.unsqueeze(0))
+#                                     if verbose:
+#                                         print(f"[DEBUG] Added square reshaped tensor with shape: {reshaped.unsqueeze(0).shape}")
+#                                 else:
+#                                     if verbose:
+#                                         print(f"[WARNING] Could not determine proper reshaping for tensor")
+#                         else:
+#                             pass
+#                 else:
+#                     pass
+#             elif hasattr(f, "x") and isinstance(f.x, torch.Tensor):
+#                 pass
+#             elif isinstance(f, torch.Tensor):
+#                 pass
+#             else:
+#                 if verbose:
+#                     print(f"[WARNING] Feature {i} is neither Data nor Tensor or List: {type(f)}")
+#         except Exception as e:
+#             print(f"[ERROR] Failed to process feature {i}: {e}")
+#             import traceback
+#             traceback.print_exc()
+    
+#     # 去除重复的特征层
+#     if features_tensor:
+#         unique_features = []
+#         shapes_seen = set()
+#         for f in features_tensor:
+#             shape_key = f.shape[-2:]  # 使用高度和宽度作为键
+#             if shape_key not in shapes_seen:
+#                 unique_features.append(f)
+#                 shapes_seen.add(shape_key)
+        
+#         if verbose:
+#             print(f"[DEBUG] Removed duplicate features: {len(features_tensor)} -> {len(unique_features)}")
+#             print(f"[DEBUG] Unique feature shapes: {[f.shape for f in unique_features]}")
+        
+#         features_tensor = unique_features
+    
+#     if verbose:
+#         print(f"[DEBUG] Returning {len(features_tensor)} processed features")
+#     return features_tensor
+
+
+# class DAGR_FCOS(nn.Module):
+#     def __init__(self, args, height, width):
+#         super().__init__()
+#         # 修改: 为类别1设置更低的检测阈值
+#         self.conf_threshold = args.score_threshold if hasattr(args, 'score_threshold') else 0.05
+#         self.conf_threshold_cls1 = 0.05  # 降低类别1的阈值，从0.1降到0.05
+        
+#         self.nms_threshold = args.nms_iou_threshold if hasattr(args, 'nms_iou_threshold') else 0.6
+#         # 修改: 为类别1设置更宽松的NMS阈值
+#         self.nms_threshold_cls1 = min(0.8, self.nms_threshold + 0.2)  # 更宽松的NMS阈值
+        
+#         self.height = height
+#         self.width = width
+#         self.args = args
+        
+#         self.debug_logger = DebugLogger(print_interval=200)
+
+#         self.backbone = Net(args, height=height, width=width)
+#         self.use_image = getattr(args, "use_image", False)
+#         self.no_events = getattr(args, "no_events", False)
+#         self.pretrain_cnn = getattr(args, "pretrain_cnn", False)
+
+#         # 修改: 使用三个不同步长的特征层
+#         strides = [4, 8, 16]
+#         in_channels = [256, 256, 256]
+        
+#         print(f"[INFO] Using in_channels: {in_channels} for FCOS head")
+        
+#         # 修改: FCOSHead初始化参数，增加中心采样半径，修改scale_exp_init
+#         self.head = FCOSHead(
+#             num_classes=self.backbone.num_classes,
+#             in_channels=in_channels,
+#             strides=strides,
+#             use_gn=True,
+#             init_prior=0.01,
+#             scale_exp_init=1.0,
+#             center_sampling=True,
+#             center_radius=4.0  # 增加中心采样半径，从3.5增加到4.0
+#         )
+
+#         if self.use_image:
+#             cnn_channels = getattr(self.backbone, "out_channels_cnn", [256, 256, 256])
+#             if not isinstance(cnn_channels, list):
+#                 cnn_channels = [cnn_channels, cnn_channels, cnn_channels]
+#             elif isinstance(cnn_channels[0], list):
+#                 cnn_channels = [cnn_channels[0][0], cnn_channels[1][0], cnn_channels[2][0]]
+            
+#             self.cnn_head = FCOSHead(
+#                 num_classes=self.backbone.num_classes,
+#                 in_channels=cnn_channels[:3],
+#                 strides=strides,
+#                 use_gn=True,
+#                 center_sampling=True,
+#                 center_radius=4.0  # 保持一致的中心采样半径
+#             )
+
+#         if "img_net_checkpoint" in args:
+#             state_dict = torch.load(args.img_net_checkpoint)
+#             init_subnetwork(self, state_dict['ema'], "backbone.net.", freeze=True)
+            
+#         self.loss_recorder = {
+#             'loss_cls': [],
+#             'loss_reg': [],
+#             'loss_ctr': [],
+#             'total_loss': [],
+#             'iteration': 0
+#         }
+        
+#         # 新增: 类别统计跟踪
+#         self.class_stats = {
+#             'total_gt_cls0': 0,
+#             'total_gt_cls1': 0,
+#             'total_pos_cls0': 0,
+#             'total_pos_cls1': 0,
+#         }
+    
+#     def _record_loss(self, losses):
+#         self.loss_recorder['iteration'] += 1
+        
+#         for k, v in losses.items():
+#             if k in self.loss_recorder:
+#                 self.loss_recorder[k].append(v.item())
+        
+#         if self.loss_recorder['iteration'] % 200 == 0:
+#             avg_losses = {}
+#             for k in ['loss_cls', 'loss_reg', 'loss_ctr', 'total_loss']:
+#                 if len(self.loss_recorder[k]) > 0:
+#                     avg_losses[k] = sum(self.loss_recorder[k]) / len(self.loss_recorder[k])
+#                 else:
+#                     avg_losses[k] = 0.0
+            
+#             print(f"[LOSS] Iter: {self.loss_recorder['iteration']}, "
+#                   f"Cls: {avg_losses['loss_cls']:.4f}, Reg: {avg_losses['loss_reg']:.4f}, "
+#                   f"Ctr: {avg_losses['loss_ctr']:.4f}, Total: {avg_losses['total_loss']:.4f}")
+            
+#             for k in ['loss_cls', 'loss_reg', 'loss_ctr', 'total_loss']:
+#                 self.loss_recorder[k] = []
+    
+#     def _convert_bbox_to_fcos_format(self, bbox, bbox_batch, num_graphs):
+#         """将边界框转换为FCOS格式"""
+#         targets = []
+        
+#         # 检查输入有效性
+#         if bbox is None or bbox.numel() == 0 or bbox_batch is None or bbox_batch.numel() == 0:
+#             device = self.head.cls_preds[0].weight.device if hasattr(self, 'head') else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+#             for _ in range(num_graphs):
+#                 targets.append(torch.zeros(0, 5, device=device if bbox is None else bbox.device))
+#             return targets
+        
+#         # 仅在迭代点整除200时打印
+#         should_print = self.debug_logger.iteration % self.debug_logger.print_interval == 0
+        
+#         # 新增: 打印初始边界框信息
+#         if should_print:
+#             print(f"\n[BBOX-STATS] 边界框分析:")
+#             print(f"[BBOX-STATS] 原始边界框: shape={bbox.shape}, 范围=[{bbox.min().item():.2f}, {bbox.max().item():.2f}]")
+            
+#             if bbox.shape[0] > 0 and bbox.shape[1] >= 5:
+#                 # 类别分布
+#                 unique_cls, cls_counts = torch.unique(bbox[:, 4].long(), return_counts=True)
+#                 print(f"[BBOX-STATS] 类别分布:")
+                
+#                 cls0_count = 0
+#                 cls1_count = 0
+                
+#                 for i in range(len(unique_cls)):
+#                     cls_id = unique_cls[i].item()
+#                     count = cls_counts[i].item()
+#                     print(f"  类别 {cls_id}: {count} 个实例 ({count/bbox.shape[0]*100:.1f}%)")
+                    
+#                     if cls_id == 0:
+#                         cls0_count = count
+#                         self.class_stats['total_gt_cls0'] += count
+#                     elif cls_id == 1:
+#                         cls1_count = count
+#                         self.class_stats['total_gt_cls1'] += count
+                
+#                 # 分析每个类别的尺寸
+#                 cls0_mask = bbox[:, 4].long() == 0
+#                 cls1_mask = bbox[:, 4].long() == 1
+                
+#                 if cls0_mask.sum() > 0:
+#                     cls0_width = bbox[cls0_mask, 3]
+#                     cls0_height = bbox[cls0_mask, 2]
+#                     cls0_area = cls0_width * cls0_height
+#                     print(f"[BBOX-STATS] 类别0尺寸: 宽度=[{cls0_width.min().item():.1f}, {cls0_width.max().item():.1f}], "
+#                           f"高度=[{cls0_height.min().item():.1f}, {cls0_height.max().item():.1f}], "
+#                           f"面积=[{cls0_area.min().item():.1f}, {cls0_area.max().item():.1f}]")
+#                     print(f"  小目标比例 (<32x32): {(cls0_area < 32*32).sum().item()/cls0_mask.sum().item()*100:.1f}%")
+                
+#                 if cls1_mask.sum() > 0:
+#                     cls1_width = bbox[cls1_mask, 3]
+#                     cls1_height = bbox[cls1_mask, 2]
+#                     cls1_area = cls1_width * cls1_height
+#                     print(f"[BBOX-STATS] 类别1尺寸: 宽度=[{cls1_width.min().item():.1f}, {cls1_width.max().item():.1f}], "
+#                           f"高度=[{cls1_height.min().item():.1f}, {cls1_height.max().item():.1f}], "
+#                           f"面积=[{cls1_area.min().item():.1f}, {cls1_area.max().item():.1f}]")
+#                     print(f"  小目标比例 (<32x32): {(cls1_area < 32*32).sum().item()/cls1_mask.sum().item()*100:.1f}%")
+                
+#                 # 批次分布
+#                 batch_counts = torch.bincount(bbox_batch, minlength=num_graphs)
+#                 print(f"[BBOX-STATS] 批次分布: {batch_counts.tolist()}")
+                
+#                 # 分析类别1在每个批次中的分布
+#                 if cls1_count > 0:
+#                     cls1_batch = bbox_batch[cls1_mask]
+#                     cls1_batch_counts = torch.bincount(cls1_batch, minlength=num_graphs)
+#                     print(f"[BBOX-STATS] 类别1批次分布: {cls1_batch_counts.tolist()}")
+                    
+#                     # 打印每个批次中类别1的框详情
+#                     for batch_idx in range(num_graphs):
+#                         batch_cls1_mask = cls1_batch == batch_idx
+#                         if batch_cls1_mask.sum() > 0:
+#                             batch_cls1_boxes = bbox[cls1_mask][batch_cls1_mask]
+#                             print(f"  批次{batch_idx}中的类别1框数量: {batch_cls1_mask.sum().item()}")
+#                             if batch_cls1_mask.sum() > 0:
+#                                 # 打印前2个框的详情
+#                                 num_to_print = min(2, batch_cls1_mask.sum().item())
+#                                 for i in range(num_to_print):
+#                                     box = batch_cls1_boxes[i]
+#                                     x, y, h, w, cls_id = box.tolist()
+#                                     print(f"    框{i}: 类别={cls_id}, 位置=({x:.1f},{y:.1f}), 尺寸={w:.1f}x{h:.1f}, 面积={w*h:.1f}")
+        
+#         # 新增: 修复高度为0的问题
+#         if bbox.shape[1] >= 5:
+#             zero_height_mask = bbox[:, 2] == 0
+#             if zero_height_mask.any():
+#                 if should_print:
+#                     print(f"[WARN] 发现{zero_height_mask.sum().item()}个高度为0的框，使用宽度值替代")
+#                 # 创建副本以避免修改原始张量
+#                 bbox = bbox.clone()
+#                 # 使用宽度作为高度的估计值
+#                 bbox[zero_height_mask, 2] = bbox[zero_height_mask, 3]
+        
+#         # 新增: 修复类别ID异常值问题
+#         if bbox.shape[1] >= 5:
+#             abnormal_cls_mask = bbox[:, 4] > 10  # 假设类别ID不会超过10
+#             if abnormal_cls_mask.any():
+#                 if should_print:
+#                     print(f"[WARN] 发现{abnormal_cls_mask.sum().item()}个异常类别ID (>10)，设置为类别0")
+#                 # 创建副本以避免修改原始张量
+#                 bbox = bbox.clone()
+#                 # 将异常类别ID设为0
+#                 bbox[abnormal_cls_mask, 4] = 0
+        
+#         # 为每个批次处理边界框
+#         for batch_idx in range(num_graphs):
+#             # 获取当前批次的边界框
+#             batch_mask = bbox_batch == batch_idx
+#             batch_bboxes = bbox[batch_mask]
+            
+#             if batch_bboxes.numel() == 0:
+#                 targets.append(torch.zeros(0, 5, device=bbox.device))
+#                 continue
+            
+#             # 解析边界框信息
+#             if batch_bboxes.shape[1] >= 5:  # 确保有足够的列
+#                 x_tl = batch_bboxes[:, 0]    # 左上角x坐标
+#                 y_tl = batch_bboxes[:, 1]    # 左上角y坐标
+#                 height = batch_bboxes[:, 2]  # 高度
+#                 width = batch_bboxes[:, 3]   # 宽度
+#                 cls = batch_bboxes[:, 4]     # 类别
+                
+#                 # 新增: 确保类别ID是整数
+#                 cls = cls.long()
+                
+#                 # 检查是否为归一化坐标
+#                 max_x = x_tl.max().item()
+#                 max_y = y_tl.max().item()
+#                 min_x = x_tl.min().item()
+#                 min_y = y_tl.min().item()
+                
+#                 # 是否为归一化坐标 - 更严格的检查
+#                 max_coord = max(max_x, max_y)
+#                 is_normalized = max_coord <= 1.0 and min_x >= 0.0 and min_y >= 0.0
+                
+#                 # 如果坐标明显小于图像尺寸，可能是归一化坐标，放大到绝对尺寸
+#                 if is_normalized:
+#                     if should_print:
+#                         print(f"[FORMAT-CONVERT] 检测到归一化坐标 (max={max_coord:.2f}), 转换为绝对坐标")
+#                     x_tl = x_tl * self.width
+#                     y_tl = y_tl * self.height
+#                     width = width * self.width
+#                     height = height * self.height
+#                 elif max_coord > 1.0 and (max_x > self.width * 1.5 or max_y > self.height * 1.5):
+#                     # 如果坐标远超图像尺寸，可能使用了不同的坐标系统
+#                     if should_print:
+#                         print(f"[FORMAT-WARNING] 坐标范围异常大 (max_x={max_x:.2f}, max_y={max_y:.2f}), "
+#                               f"可能需要缩放")
+                
+#                 # 新增: 确保高度和宽度为正值
+#                 height = torch.clamp(height, min=1.0)
+#                 width = torch.clamp(width, min=1.0)
+                
+#                 # 过滤异常大的边界框
+#                 max_reasonable_size = max(self.width, self.height) * 2  # 合理的最大尺寸
+#                 valid_size_mask = (width < max_reasonable_size) & (height < max_reasonable_size)
+                
+#                 # 应用有效性过滤
+#                 x_tl = x_tl[valid_size_mask]
+#                 y_tl = y_tl[valid_size_mask]
+#                 height = height[valid_size_mask]
+#                 width = width[valid_size_mask]
+#                 cls = cls[valid_size_mask]
+                
+#                 # 计算面积以检查有效性
+#                 areas = width * height
+#                 valid_mask = areas > 0
+                
+#                 if valid_mask.sum() == 0:
+#                     targets.append(torch.zeros(0, 5, device=bbox.device))
+#                     continue
+                    
+#                 # 应用面积有效性过滤
+#                 x_tl = x_tl[valid_mask]
+#                 y_tl = y_tl[valid_mask]
+#                 height = height[valid_mask]
+#                 width = width[valid_mask]
+#                 cls = cls[valid_mask]
+                
+#                 # 从左上角转换为中心点（FCOS需要中心点格式）
+#                 x_center = x_tl + width / 2
+#                 y_center = y_tl + height / 2
+                
+#                 # 检查坐标是否在合理范围内
+#                 x_center = torch.clamp(x_center, 0, self.width)
+#                 y_center = torch.clamp(y_center, 0, self.height)
+                
+#                 # 新增: 打印转换后的统计信息，仅在特定迭代次数
+#                 if should_print and (batch_idx == 0 or batch_bboxes.shape[0] > 0):
+#                     print(f"[DEBUG] Batch {batch_idx}: 有效框 {x_center.shape[0]}/{batch_bboxes.shape[0]}")
+#                     if x_center.shape[0] > 0:
+#                         cls_counts = torch.bincount(cls, minlength=2)
+#                         print(f"  - 类别分布: 类别0={cls_counts[0].item()}, 类别1={cls_counts[1].item()}")
+#                         print(f"  - 中心点 x: [{x_center.min().item():.1f}, {x_center.max().item():.1f}], y: [{y_center.min().item():.1f}, {y_center.max().item():.1f}]")
+#                         print(f"  - 尺寸 w: [{width.min().item():.1f}, {width.max().item():.1f}], h: [{height.min().item():.1f}, {height.max().item():.1f}]")
+                
+#                 # 创建FCOS格式的目标: [class_id, center_x, center_y, width, height]
+#                 fcos_target = torch.stack([cls, x_center, y_center, width, height], dim=1)
+#                 targets.append(fcos_target)
+#             else:
+#                 # 边界框格式不正确，添加空目标
+#                 targets.append(torch.zeros(0, 5, device=bbox.device))
+        
+#         # 检查转换后的目标是否包含类别1
+#         if should_print:
+#             has_cls1 = False
+#             for batch_idx, target in enumerate(targets):
+#                 if target.shape[0] > 0:
+#                     # 检查类别分布
+#                     cls_column = target[:, 0].long()
+#                     cls_counts = torch.bincount(cls_column, minlength=2)
+#                     print(f"[TARGET-CHECK] 批次{batch_idx}转换后类别分布: 类别0={cls_counts[0].item()}, 类别1={cls_counts[1].item()}")
+                    
+#                     # 如果有类别1，打印详细信息
+#                     if cls_counts[1] > 0:
+#                         has_cls1 = True
+#                         cls1_mask = cls_column == 1
+#                         cls1_targets = target[cls1_mask]
+#                         print(f"[TARGET-CHECK] 批次{batch_idx}中的类别1目标数量: {cls1_targets.shape[0]}")
+#                         if cls1_targets.shape[0] > 0:
+#                             num_to_print = min(2, cls1_targets.shape[0])
+#                             for i in range(num_to_print):
+#                                 tgt = cls1_targets[i]
+#                                 cls_id, cx, cy, w, h = tgt.tolist()
+#                                 print(f"  目标{i}: 类别={cls_id}, 中心=({cx:.1f},{cy:.1f}), 尺寸={w:.1f}x{h:.1f}, 面积={w*h:.1f}")
+            
+#             if not has_cls1:
+#                 print("[TARGET-CHECK] 警告: 转换后没有类别1的目标!")
+                
+#         return targets
+    
+#     def forward(self, x: Data, reset=True, return_targets=True, filtering=True):
+#         if self.training:
+#             self.debug_logger.log_iteration()
+            
+#             # 判断是否应该在当前迭代打印信息
+#             should_print = self.debug_logger.iteration % self.debug_logger.print_interval == 0
+#             is_first_iter = self.debug_logger.iteration <= 1
+            
+#             # 获取并打印GT框的统计信息，仅在特定迭代次数
+#             if should_print and hasattr(x, 'bbox') and x.bbox is not None:
+#                 print(f"\n[GT-CHECK] 原始GT框检查:")
+#                 print(f"[GT-CHECK] 输入GT框: shape={x.bbox.shape}, batch索引: shape={x.bbox_batch.shape}")
+#                 print(f"[GT-CHECK] 批次索引唯一值: {x.bbox_batch.unique().tolist()}")
+#                 print(f"[GT-CHECK] 批次数量: {x.num_graphs}")
+                
+#                 # 新增: 检查原始类别分布
+#                 if x.bbox.shape[0] > 0 and x.bbox.shape[1] >= 5:
+#                     # 类别分布
+#                     cls_column = x.bbox[:, 4].long()
+#                     cls_counts = torch.bincount(cls_column, minlength=2)
+#                     print(f"[GT-CHECK] 原始GT类别分布: 类别0={cls_counts[0].item()}, 类别1={cls_counts[1].item()}")
+                    
+#                     # 如果有类别1，打印详细信息
+#                     if cls_counts[1] > 0:
+#                         cls1_mask = cls_column == 1
+#                         cls1_boxes = x.bbox[cls1_mask]
+#                         cls1_batch_indices = x.bbox_batch[cls1_mask]
+                        
+#                         print(f"[GT-CHECK] 类别1的框数量: {cls1_boxes.shape[0]}")
+#                         print(f"[GT-CHECK] 类别1的批次分布: {torch.bincount(cls1_batch_indices, minlength=x.num_graphs).tolist()}")
+                        
+#                         # 打印每个批次中类别1的框
+#                         for batch_idx in range(x.num_graphs):
+#                             batch_cls1_mask = cls1_batch_indices == batch_idx
+#                             batch_cls1_count = batch_cls1_mask.sum().item()
+                            
+#                             if batch_cls1_count > 0:
+#                                 batch_cls1_boxes = cls1_boxes[batch_cls1_mask]
+#                                 print(f"[GT-CHECK] 批次{batch_idx}中的类别1框数量: {batch_cls1_count}")
+#                                 # 打印前2个框的详情
+#                                 num_to_print = min(2, batch_cls1_count)
+#                                 for i in range(num_to_print):
+#                                     box = batch_cls1_boxes[i]
+#                                     x, y, h, w, cls_id = box.tolist()
+#                                     print(f"  框{i}: 位置=({x:.1f},{y:.1f}), 尺寸={w:.1f}x{h:.1f}")
+            
+#             targets = self._convert_bbox_to_fcos_format(x.bbox, x.bbox_batch, x.num_graphs)
+            
+#             # 打印转换后的目标信息，仅在特定迭代次数
+#             if should_print:
+#                 print(f"[TARGET-INFO] 转换后的目标: {len(targets)} 批次")
+#                 for i, target in enumerate(targets):
+#                     print(f"  批次 {i}: {target.shape[0]} 个目标")
+#                     if target.shape[0] > 0:
+#                         cls_counts = torch.bincount(target[:, 0].long(), minlength=2)
+#                         print(f"    类别分布: 类别0={cls_counts[0].item()}, 类别1={cls_counts[1].item()}")
+#                         print(f"    框统计 - cx: [{target[:, 1].min():.1f}, {target[:, 1].max():.1f}], "
+#                               f"cy: [{target[:, 2].min():.1f}, {target[:, 2].max():.1f}], "
+#                               f"w: [{target[:, 3].min():.1f}, {target[:, 3].max():.1f}], "
+#                               f"h: [{target[:, 4].min():.1f}, {target[:, 4].max():.1f}]")
+            
+#             features = self.backbone(x)
+            
+#             if is_first_iter:
+#                 print(f"[DEBUG] Backbone features type: {type(features)}")
+#                 if isinstance(features, list) or isinstance(features, tuple):
+#                     print(f"[DEBUG] Backbone features list length: {len(features)}")
+#                     for i, feat in enumerate(features):
+#                         print(f"[DEBUG] Feature {i} type: {type(feat)}")
+#                         if isinstance(feat, list):
+#                             print(f"[DEBUG] Feature {i} list length: {len(feat)}")
+#                             for j, subfeat in enumerate(feat):
+#                                 print(f"[DEBUG] Subfeat {i}.{j} type: {type(subfeat)}")
+#                                 if isinstance(subfeat, torch.Tensor):
+#                                     print(f"[DEBUG] Subfeat {i}.{j} shape: {subfeat.shape}")
+#                         elif isinstance(feat, torch.Tensor):
+#                             print(f"[DEBUG] Feature {i} shape: {feat.shape}")
+            
+#             if isinstance(features, list) or isinstance(features, tuple):
+#                 if len(features) == 1:
+#                     if isinstance(features[0], list) and len(features[0]) > 1 and isinstance(features[0][1], torch.Tensor):
+#                         second_feature = features[0][1] if len(features[0]) > 1 else None
+#                         features = [features[0], [features[0][0], second_feature]]
+#                     else:
+#                         features = [features[0], features[0]]
+#                 elif len(features) > 2:
+#                     features = features[:2]
+            
+#             if is_first_iter:
+#                 print(f"[DEBUG] Processed features:")
+#                 for i, feat in enumerate(features):
+#                     if isinstance(feat, list):
+#                         for j, subfeat in enumerate(feat):
+#                             if isinstance(subfeat, torch.Tensor):
+#                                 print(f"[DEBUG] Feature {i}.{j} shape: {subfeat.shape}")
+            
+#             try:
+#                 if is_first_iter:
+#                     print(f"[DEBUG] Features before unpack:")
+#                     for i, feat in enumerate(features):
+#                         if isinstance(feat, list):
+#                             for j, subfeat in enumerate(feat):
+#                                 if isinstance(subfeat, torch.Tensor):
+#                                     print(f"[DEBUG] Feature {i}.{j} shape: {subfeat.shape}")
+                
+#                 features_unpacked = unpack_fused_features(features, self.debug_logger)
+                
+#                 if is_first_iter:
+#                     print(f"[DEBUG] Features after unpack: {[f.shape for f in features_unpacked]}")
+                
+#                 self.debug_logger.log_feature_shapes(features_unpacked)
+                
+#                 # 确保有三层特征
+#                 if len(features_unpacked) == 1:
+#                     feat1 = features_unpacked[0]
+#                     feat2 = F.avg_pool2d(feat1, kernel_size=2, stride=2)
+#                     feat3 = F.avg_pool2d(feat2, kernel_size=2, stride=2)
+#                     features_unpacked = [feat1, feat2, feat3]
+#                     if is_first_iter:
+#                         print(f"[DEBUG] Generated second and third features by downsampling:")
+#                         print(f"  feat1: {feat1.shape}, feat2: {feat2.shape}, feat3: {feat3.shape}")
+#                 elif len(features_unpacked) == 2:
+#                     feat1 = features_unpacked[0]
+#                     feat2 = features_unpacked[1]
+#                     feat3 = F.avg_pool2d(feat2, kernel_size=2, stride=2)
+#                     features_unpacked = [feat1, feat2, feat3]
+#                     if is_first_iter:
+#                         print(f"[DEBUG] Generated third feature by downsampling:")
+#                         print(f"  feat1: {feat1.shape}, feat2: {feat2.shape}, feat3: {feat3.shape}")
+                
+#             except Exception as e:
+#                 print(f"[ERROR] Error unpacking features: {e}")
+#                 import traceback
+#                 traceback.print_exc()
+                
+#                 dummy_param = next(self.parameters())
+#                 zero_loss = dummy_param.mean() * 0
+                
+#                 return {
+#                     'loss_cls': zero_loss,
+#                     'loss_reg': zero_loss,
+#                     'loss_ctr': zero_loss,
+#                     'total_loss': zero_loss
+#                 }
+            
+#             if not features_unpacked or len(features_unpacked) == 0:
+#                 print("[WARNING] No valid features extracted from backbone, returning zero loss")
+#                 dummy_param = next(self.parameters())
+#                 zero_loss = dummy_param.mean() * 0
+                
+#                 return {
+#                     'loss_cls': zero_loss,
+#                     'loss_reg': zero_loss,
+#                     'loss_ctr': zero_loss,
+#                     'total_loss': zero_loss
+#                 }
+            
+#             try:
+#                 self.head.debug_logger = self.debug_logger
+#                 # 新增: 传递类别统计给head
+#                 self.head.class_stats = self.class_stats
+                
+#                 cls_scores, reg_preds, centernesses = self.head(features_unpacked)
+                
+#                 if is_first_iter:
+#                     print(f"[DEBUG] Feature shapes: {[f.shape for f in features_unpacked]}")
+#                     print(f"[DEBUG] cls_scores length: {len(cls_scores)}, shapes: {[cs.shape for cs in cls_scores if isinstance(cs, torch.Tensor)]}")
+#                     print(f"[DEBUG] reg_preds length: {len(reg_preds)}, shapes: {[rp.shape for rp in reg_preds if isinstance(rp, torch.Tensor)]}")
+#                     print(f"[DEBUG] centernesses length: {len(centernesses)}, shapes: {[cn.shape for cn in centernesses if isinstance(cn, torch.Tensor)]}")
+                
+#                 # 在损失计算前记录分类预测分布，仅在特定迭代次数
+#                 if should_print:
+#                     for level_idx, cls_score in enumerate(cls_scores):
+#                         # 计算每个类别的预测分布
+#                         cls_prob = torch.sigmoid(cls_score)
+#                         print(f"[CLS-STATS] Level {level_idx} classification probabilities:")
+#                         print(f"  Mean: {cls_prob.mean(dim=[0,2,3])}")
+#                         print(f"  Max: {cls_prob.max(dim=2)[0].max(dim=2)[0].mean(dim=0)}")
+#                         print(f"  # Preds > 0.5: {(cls_prob > 0.5).sum(dim=[0,2,3])}")
+#                         print(f"  # Preds > 0.3: {(cls_prob > 0.3).sum(dim=[0,2,3])}")
+#                         print(f"  # Preds > 0.1: {(cls_prob > 0.1).sum(dim=[0,2,3])}")
+                
+#                 # 检查类别1是否存在于targets中
+#                 if should_print:
+#                     all_batch_cls1_count = 0
+#                     for batch_idx in range(len(targets)):
+#                         batch_targets = targets[batch_idx]
+#                         if batch_targets.numel() > 0:
+#                             cls1_mask = batch_targets[:, 0].long() == 1
+#                             batch_cls1_count = cls1_mask.sum().item()
+#                             all_batch_cls1_count += batch_cls1_count
+                    
+#                     print(f"[CLS1-CHECK] 所有批次中类别1的目标总数: {all_batch_cls1_count}")
+                
+#                 losses = self.head.loss(cls_scores, reg_preds, centernesses, targets)
+                
+#                 for k, v in losses.items():
+#                     if not v.requires_grad:
+#                         dummy_param = next(self.parameters())
+#                         losses[k] = v + dummy_param.sum() * 0
+                
+#                 self._record_loss(losses)
+                
+#                 # 新增: 打印类别统计
+#                 if should_print:
+#                     print(f"[CLASS-STATS] 累计GT框: 类别0={self.class_stats['total_gt_cls0']}, 类别1={self.class_stats['total_gt_cls1']}")
+#                     print(f"[CLASS-STATS] 累计正样本: 类别0={self.class_stats['total_pos_cls0']}, 类别1={self.class_stats['total_pos_cls1']}")
+                    
+#                     if self.class_stats['total_pos_cls0'] > 0 or self.class_stats['total_pos_cls1'] > 0:
+#                         gt_ratio = self.class_stats['total_gt_cls0'] / max(1, self.class_stats['total_gt_cls1'])
+#                         pos_ratio = self.class_stats['total_pos_cls0'] / max(1, self.class_stats['total_pos_cls1'])
+#                         print(f"[CLASS-STATS] 类别比例(0:1): GT={gt_ratio:.1f}, 正样本={pos_ratio:.1f}")
+                        
+#                         # 计算正样本采样率
+#                         cls0_sample_rate = self.class_stats['total_pos_cls0'] / max(1, self.class_stats['total_gt_cls0']) * 100
+#                         cls1_sample_rate = self.class_stats['total_pos_cls1'] / max(1, self.class_stats['total_gt_cls1']) * 100
+#                         print(f"[CLASS-STATS] 正样本采样率: 类别0={cls0_sample_rate:.1f}%, 类别1={cls1_sample_rate:.1f}%")
+                
+#                 return losses
+#             except Exception as e:
+#                 print(f"[ERROR] Error during forward pass: {e}")
+#                 import traceback
+#                 traceback.print_exc()
+                
+#                 dummy_param = next(self.parameters())
+#                 zero_loss = dummy_param.mean() * 0
+                
+#                 return {
+#                     'loss_cls': zero_loss,
+#                     'loss_reg': zero_loss,
+#                     'loss_ctr': zero_loss,
+#                     'total_loss': zero_loss
+#                 }
+        
+#         else:
+#             x.reset = reset
+            
+#             features = self.backbone(x)
+            
+#             if isinstance(features, list) or isinstance(features, tuple):
+#                 if len(features) == 1:
+#                     features = [features[0], features[0]]
+#                 elif len(features) > 2:
+#                     features = features[:2]
+            
+#             features = unpack_fused_features(features)
+            
+#             if not features or len(features) == 0:
+#                 device = next(self.parameters()).device
+#                 empty_result = []
+#                 for _ in range(x.num_graphs):
+#                     empty_result.append({
+#                         'boxes': torch.zeros((0, 4), device=device),
+#                         'scores': torch.zeros(0, device=device),
+#                         'labels': torch.zeros(0, dtype=torch.long, device=device),
+#                         'height': torch.tensor(self.height, device=device),
+#                         'width': torch.tensor(self.width, device=device)
+#                     })
+                
+#                 if return_targets and hasattr(x, 'bbox'):
+#                     targets = convert_to_evaluation_format(x)
+#                     return empty_result, targets
+#                 return empty_result
+            
+#             # 确保有三层特征
+#             if len(features) == 1:
+#                 feat1 = features[0]
+#                 feat2 = F.avg_pool2d(feat1, kernel_size=2, stride=2)
+#                 feat3 = F.avg_pool2d(feat2, kernel_size=2, stride=2)
+#                 features = [feat1, feat2, feat3]
+#             elif len(features) == 2:
+#                 feat1 = features[0]
+#                 feat2 = features[1]
+#                 feat3 = F.avg_pool2d(feat2, kernel_size=2, stride=2)
+#                 features = [feat1, feat2, feat3]
+            
+#             cls_scores, reg_preds, centernesses = self.head(features)
+            
+#             if not cls_scores or len(cls_scores) == 0:
+#                 device = next(self.parameters()).device
+#                 empty_result = []
+#                 for _ in range(x.num_graphs):
+#                     empty_result.append({
+#                         'boxes': torch.zeros((0, 4), device=device),
+#                         'scores': torch.zeros(0, device=device),
+#                         'labels': torch.zeros(0, dtype=torch.long, device=device),
+#                         'height': torch.tensor(self.height, device=device),
+#                         'width': torch.tensor(self.width, device=device)
+#                     })
+                
+#                 if return_targets and hasattr(x, 'bbox'):
+#                     targets = convert_to_evaluation_format(x)
+#                     return empty_result, targets
+#                 return empty_result
+            
+#             try:
+#                 # 打印评估阶段的预测分布
+#                 for level_idx, cls_score in enumerate(cls_scores):
+#                     cls_prob = torch.sigmoid(cls_score)
+#                     print(f"[EVAL-CLS] Level {level_idx} classification probabilities:")
+#                     print(f"  Mean: {cls_prob.mean(dim=[0,2,3])}")
+#                     print(f"  Max: {cls_prob.max(dim=2)[0].max(dim=2)[0].mean(dim=0)}")
+#                     print(f"  # Preds > 0.5: {(cls_prob > 0.5).sum(dim=[0,2,3])}")
+#                     print(f"  # Preds > 0.3: {(cls_prob > 0.3).sum(dim=[0,2,3])}")
+#                     print(f"  # Preds > 0.1: {(cls_prob > 0.1).sum(dim=[0,2,3])}")
+                
+#                 # 使用类别特定的检测阈值和NMS阈值
+#                 try:
+#                     detections = self.head.get_bboxes(
+#                         cls_scores, 
+#                         reg_preds, 
+#                         centernesses, 
+#                         score_thr=self.conf_threshold,
+#                         nms_thr=self.nms_threshold,
+#                         max_num=100,
+#                         score_thr_cls1=self.conf_threshold_cls1,
+#                         nms_thr_cls1=self.nms_threshold_cls1
+#                     )
+#                 except Exception as e:
+#                     print(f"Error in get_bboxes: {e}")
+#                     device = next(self.parameters()).device
+#                     detections = []
+#                     for _ in range(x.num_graphs):
+#                         detections.append({
+#                             'boxes': torch.zeros((0, 4), device=device),
+#                             'scores': torch.zeros(0, device=device),
+#                             'labels': torch.zeros(0, dtype=torch.long, device=device)
+#                         })
+                
+#                 # 打印检测结果统计
+#                 print(f"[DETECTION-STATS] Detection results:")
+#                 for batch_idx, det in enumerate(detections):
+#                     print(f"  Batch {batch_idx}: {det['boxes'].shape[0]} detections")
+#                     if det['boxes'].shape[0] > 0:
+#                         print(f"    Score range: [{det['scores'].min():.3f}, {det['scores'].max():.3f}]")
+#                         print(f"    Class distribution: {torch.bincount(det['labels'], minlength=2)}")
+                        
+#                         # 按类别分组打印分数统计
+#                         for cls_id in range(2):
+#                             cls_mask = det['labels'] == cls_id
+#                             if cls_mask.sum() > 0:
+#                                 cls_scores = det['scores'][cls_mask]
+#                                 print(f"    Class {cls_id} scores: min={cls_scores.min():.3f}, max={cls_scores.max():.3f}, mean={cls_scores.mean():.3f}, count={cls_mask.sum().item()}")
+                        
+#                         # 详细打印一些检测框
+#                         max_boxes_to_print = min(3, det['boxes'].shape[0])
+#                         print(f"    Detection examples (top {max_boxes_to_print}):")
+#                         scores, indices = det['scores'].sort(descending=True)
+#                         for i in range(max_boxes_to_print):
+#                             idx = indices[i]
+#                             box = det['boxes'][idx]
+#                             x1, y1, x2, y2 = box.tolist()
+#                             w, h = x2 - x1, y2 - y1
+#                             cls = det['labels'][idx].item()
+#                             score = det['scores'][idx].item()
+#                             print(f"      Det #{i}: class={cls}, score={score:.3f}, box=[{x1:.1f},{y1:.1f},{x2:.1f},{y2:.1f}], w={w:.1f}, h={h:.1f}")
+                
+#             except Exception as e:
+#                 print(f"Error in evaluation processing: {e}")
+#                 import traceback
+#                 traceback.print_exc()
+#                 device = next(self.parameters()).device
+#                 empty_result = []
+#                 for _ in range(x.num_graphs):
+#                     empty_result.append({
+#                         'boxes': torch.zeros((0, 4), device=device),
+#                         'scores': torch.zeros(0, device=device),
+#                         'labels': torch.zeros(0, dtype=torch.long, device=device),
+#                         'height': torch.tensor(self.height, device=device),
+#                         'width': torch.tensor(self.width, device=device)
+#                     })
+                
+#                 if return_targets and hasattr(x, 'bbox'):
+#                     targets = convert_to_evaluation_format(x)
+#                     return empty_result, targets
+#                 return empty_result
+            
+#             # 关键修复：正确的坐标转换格式
+#             formatted_detections = []
+#             for det in detections:
+#                 boxes = det['boxes']
+#                 scores = det['scores']
+#                 labels = det['labels']
+                
+#                 # 检查有无检测结果
+#                 if boxes.size(0) > 0:
+#                     # 修复核心问题：从XYXY格式直接转换为左上角+宽高格式
+#                     x1, y1, x2, y2 = boxes.unbind(1)
+#                     w = x2 - x1  # 宽度
+#                     h = y2 - y1  # 高度
+                    
+#                     # 确保宽度和高度都是正值
+#                     w = torch.clamp(w, min=1.0)
+#                     h = torch.clamp(h, min=1.0)
+                    
+#                     # 使用正确的格式：左上角坐标+宽高 [x1, y1, w, h]
+#                     boxes = torch.stack([x1, y1, w, h], dim=1)
+                    
+#                     # 为了调试，打印一些信息
+#                     print(f"[BOX-FORMAT] Converting {len(boxes)} boxes to [x1, y1, w, h] format")
+#                     if len(boxes) > 0:
+#                         print(f"  Width range: [{w.min().item():.1f}, {w.max().item():.1f}]")
+#                         print(f"  Height range: [{h.min().item():.1f}, {h.max().item():.1f}]")
+                
+#                 height_tensor = torch.tensor(self.height, device=boxes.device)
+#                 width_tensor = torch.tensor(self.width, device=boxes.device)
+                
+#                 formatted_detections.append({
+#                     'boxes': boxes,
+#                     'scores': scores,
+#                     'labels': labels,
+#                     'height': height_tensor,
+#                     'width': width_tensor
+#                 })
+            
+#             # 最后的检查，确保所有框都是有效的
+#             for i, det in enumerate(formatted_detections):
+#                 if det['boxes'].size(0) > 0:
+#                     # 检查是否有任何宽度或高度小于或等于0
+#                     invalid_boxes = (det['boxes'][:, 2] <= 0) | (det['boxes'][:, 3] <= 0)
+#                     if invalid_boxes.any():
+#                         print(f"[WARNING] Batch {i}: Found {invalid_boxes.sum().item()} invalid boxes with zero or negative width/height")
+#                         # 过滤掉无效的框
+#                         valid_mask = ~invalid_boxes
+#                         det['boxes'] = det['boxes'][valid_mask]
+#                         det['scores'] = det['scores'][valid_mask]
+#                         det['labels'] = det['labels'][valid_mask]
+#                         print(f"  After filtering: {det['boxes'].size(0)} valid boxes")
+            
+#             if return_targets and hasattr(x, 'bbox'):
+#                 targets = convert_to_evaluation_format(x)
+#                 return formatted_detections, targets
+#             return formatted_detections
+
+
+
+
 # import torch
 # import torch.nn as nn
 # import torch.nn.functional as F
