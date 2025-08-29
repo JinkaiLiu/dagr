@@ -53,7 +53,6 @@ class mem_update(nn.Module):
             # 推理模式：生成单独的二进制脉冲
             integer_spike = self.qtrick(mem)
             
-            # 这是一个简化版本，实际部署时应使用真正的稀疏计算
             # 在这里我们生成D个二进制脉冲张量，用于后续的稀疏计算
             binary_spikes = []
             for d in range(1, self.max_value + 1):
