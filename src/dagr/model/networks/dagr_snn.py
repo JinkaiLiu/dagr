@@ -10,7 +10,7 @@ from yolox.models import IOUloss
 from yolox.models.yolo_head import YOLOXHead
 
 class CNNModule(nn.Module):
-    """标准CNN模块，替代ConvBlock"""
+    """处理SNN骨干网络输出的规则张量(而非图结构)，将GNNhead替换为纯CNNhead"""
     def __init__(self, in_channels, out_channels):
         super().__init__()
         self.conv = nn.Sequential(
