@@ -481,109 +481,42 @@ def compute_pooling_at_each_layer(pooling_dim_at_output, num_layers):
 
 def voxelize_events(data, height=215, width=320):
     """
-    将事件点云数据体素化为适合SNN处理的张量
-    
-    参数:
-        data: PyTorch Geometric的DataBatch对象，包含事件点云
-        height: 图像高度
-        width: 图像宽度
-        
-    返回:
-        event_tensor: 形状为[B,C,H,W]的张量，C=2表示正负极性
+    将事件点云体素化为 [B, 2, H, W]，通道0=正极(>0)，通道1=负极(<0)
+    向量化实现：一次 scatter_add，不使用 python for-loop
     """
-    # 从data获取图像尺寸
+    # 解析尺寸
     if hasattr(data, 'width') and hasattr(data, 'height'):
         try:
-            if hasattr(data.width, 'item'):
-                width = data.width.item()
-                height = data.height.item()
-            elif len(data.width) == 1:
-                width = data.width[0].item()
-                height = data.height[0].item()
-            else:
-                width = data.width[0].item()
-                height = data.height[0].item()
-        except (ValueError, IndexError, RuntimeError) as e:
-            print(f"Error accessing width/height: {e}, using defaults: {width}x{height}")
-    
-    # 获取批次大小
+            width = int(data.width[0].item() if hasattr(data.width, '__len__') else data.width.item())
+            height = int(data.height[0].item() if hasattr(data.height, '__len__') else data.height.item())
+        except Exception:
+            pass
+
+    device = data.x.device
+    # 批大小
     try:
         batch_size = int(data.batch.max().item()) + 1
-    except (ValueError, AttributeError) as e:
-        print(f"Error determining batch size: {e}, using default batch size of 1")
+    except Exception:
         batch_size = 1
-    
-    # 创建空的事件体素
-    device = data.x.device
-    event_tensor = torch.zeros((batch_size, 2, height, width), device=device)
-    
-    # 从data获取信息
-    pos = data.pos[:, :2]
-    polarity = data.x.view(-1)
-    batch_idx = data.batch
-    
-    # 计算像素位置
-    pos_x = (pos[:, 0] * width).long().clamp(0, width - 1)
-    pos_y = (pos[:, 1] * height).long().clamp(0, height - 1)
-    pol_idx = (polarity < 0).long()
-    
-    # 使用向量化操作
-    try:
-        # 创建索引张量 [N, 4] 其中N是事件数，4对应(batch, channel, y, x)
-        indices = torch.stack([batch_idx, pol_idx, pos_y, pos_x], dim=1)
-        
-        # 验证索引是否有效
-        valid_indices = (
-            (indices[:, 0] >= 0) & (indices[:, 0] < batch_size) &
-            (indices[:, 1] >= 0) & (indices[:, 1] < 2) &
-            (indices[:, 2] >= 0) & (indices[:, 2] < height) &
-            (indices[:, 3] >= 0) & (indices[:, 3] < width)
-        )
-        
-        # 只保留有效索引
-        if not torch.all(valid_indices):
-            indices = indices[valid_indices]
-        
-        # 使用index_add_累加事件
-        values = torch.ones(indices.shape[0], device=device)
-        
-        for i in range(indices.shape[0]):
-            b, c, y, x = indices[i]
-            event_tensor[b, c, y, x] += 1
-            
-    except Exception as e:
-        print(f"Vectorized approach failed: {e}, falling back to sparse tensor method")
-        
-        try:
-            # 尝试使用sparse_coo_tensor方法
-            indices = torch.stack([batch_idx, pol_idx, pos_y, pos_x], dim=0)
-            values = torch.ones_like(batch_idx, dtype=torch.float, device=device)
-            
-            sparse_tensor = torch.sparse_coo_tensor(
-                indices, values, 
-                size=(batch_size, 2, height, width),
-                device=device
-            )
-            
-            # 转换为密集张量
-            event_tensor = sparse_tensor.to_dense()
-            
-        except Exception as e2:
-            print(f"Sparse tensor approach failed: {e2}, falling back to slow method")
-            
-            # 如果所有向量化方法都失败，回退到逐点处理
-            for i in range(len(pos)):
-                try:
-                    b = int(batch_idx[i].cpu().numpy())
-                    p = int(pol_idx[i].cpu().numpy())
-                    y = int(pos_y[i].cpu().numpy())
-                    x = int(pos_x[i].cpu().numpy())
-                    
-                    if 0 <= b < batch_size and 0 <= p < 2 and 0 <= y < height and 0 <= x < width:
-                        event_tensor[b, p, y, x] += 1
-                except Exception:
-                    continue
-    
+
+    # 取事件属性
+    pos = data.pos[:, :2]                             # [N,2] 归一化坐标(0..1)
+    pol = data.x.view(-1)                             # [N]   +1/-1
+    b   = data.batch                                  # [N]
+
+    # 离散化为像素索引
+    x = (pos[:, 0] * width ).to(torch.long).clamp_(0, width  - 1)
+    y = (pos[:, 1] * height).to(torch.long).clamp_(0, height - 1)
+    c = (pol < 0).to(torch.long)                      # 正极=0, 负极=1
+
+    # 构造一维扁平索引：(((b*2)+c)*H + y)*W + x
+    H, W = height, width
+    flat_idx = (((b * 2) + c) * H + y) * W + x        # [N]
+
+    # 一次性聚合
+    out = torch.zeros(batch_size * 2 * H * W, device=device, dtype=torch.float32)
+    out.scatter_add_(0, flat_idx, torch.ones_like(flat_idx, dtype=out.dtype, device=device))
+    event_tensor = out.view(batch_size, 2, H, W).contiguous()
     return event_tensor
 
 class EventProcessor(nn.Module):
