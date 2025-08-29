@@ -37,16 +37,37 @@ class MultiSpike4(nn.Module):
 
 # 膜电位更新模块，整数值到二进制脉冲的转换
 class mem_update(nn.Module):
-    def __init__(self, act=False):
+    def __init__(self, act=False, max_value=4):
         super(mem_update, self).__init__()
         self.act = act
         self.qtrick = MultiSpike4()
+        self.max_value = max_value
+        self.inference_mode = False
+
+    def set_inference_mode(self, mode=True):
+        self.inference_mode = mode
 
     def forward(self, x):
         mem = x.sum(0).unsqueeze(0)
-        spike = self.qtrick(mem)
-        spike = expand_tensor_cumulative(spike)
-        return spike
+        if self.inference_mode:
+            # 推理模式：生成单独的二进制脉冲
+            integer_spike = self.qtrick(mem)
+            
+            # 这是一个简化版本，实际部署时应使用真正的稀疏计算
+            # 在这里我们生成D个二进制脉冲张量，用于后续的稀疏计算
+            binary_spikes = []
+            for d in range(1, self.max_value + 1):
+                # 生成二进制掩码：大于等于d的位置输出1，否则输出0
+                binary_spike = (integer_spike >= d).float()
+                binary_spikes.append(binary_spike)
+                
+            return binary_spikes
+        else:
+            # 训练模式：使用整数值脉冲
+            spike = self.qtrick(mem)
+            # 训练时仍然展开为序列，但作为一个整体处理
+            spike = expand_tensor_cumulative(spike, self.max_value)
+            return spike
 
 
 # 将整数值扩展为二进制脉冲序列
@@ -65,32 +86,78 @@ def expand_tensor_cumulative(tensor, max_value=4):
 
 # 标准卷积+BN层，处理二进制脉冲序列
 class Conv2d_bn(nn.Module):
-    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, bias=None, first_layer=False):
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, bias=None, first_layer=False, max_value=4):
         super().__init__()
         self.conv = nn.Conv2d(c1, c2, k, s, autopad(k, p, d), groups=g, dilation=d, bias=None)
         self.bn = nn.BatchNorm2d(c2)
         self.first_layer = first_layer
+        self.inference_mode = False
+        self.max_value = max_value
+        
+    def set_inference_mode(self, mode=True):
+        self.inference_mode = mode
 
     def forward(self, x, first_layer=False):
-        x = self.conv(x)
-        if first_layer == False:
-            new_shape = (4, x.shape[0] // 4) + x.shape[1:]
-            x = x.view(new_shape).sum(dim=0)
-        x = self.bn(x)
-        return x
+        if self.inference_mode and not first_layer:
+            # 推理模式：处理二进制脉冲列表
+            if isinstance(x, list):
+                # 每个元素是一个二进制脉冲张量
+                results = []
+                for binary_spike in x:
+                    # 对每个二进制脉冲应用卷积
+                    # 在实际硬件上，这里会使用稀疏计算，只处理值为1的位置
+                    output = self.conv(binary_spike)
+                    results.append(output)
+                
+                # 合并所有结果
+                output = sum(results)
+                output = self.bn(output)
+                return output
+            else:
+                # 如果输入不是列表，回退到标准处理
+                x = self.conv(x)
+                x = self.bn(x)
+                return x
+        else:
+            # 训练模式：标准处理
+            x = self.conv(x)
+            if first_layer == False:
+                new_shape = (self.max_value, x.shape[0] // self.max_value) + x.shape[1:]
+                x = x.view(new_shape).sum(dim=0)
+            x = self.bn(x)
+            return x
 
 
 # 标准卷积（无BN）
 class Conv2d(nn.Module):
-    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, bias=None):
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, bias=None, max_value=4):
         super().__init__()
         self.conv = nn.Conv2d(c1, c2, k, s, autopad(k, p, d), groups=g, dilation=d, bias=None)
+        self.inference_mode = False
+        self.max_value = max_value
+        
+    def set_inference_mode(self, mode=True):
+        self.inference_mode = mode
 
     def forward(self, x):
-        x = self.conv(x)
-        new_shape = (4, x.shape[0] // 4) + x.shape[1:]
-        x = x.view(new_shape).sum(dim=0)
-        return x
+        if self.inference_mode:
+            # 推理模式：处理二进制脉冲列表
+            if isinstance(x, list):
+                results = []
+                for binary_spike in x:
+                    output = self.conv(binary_spike)
+                    results.append(output)
+                
+                return sum(results)
+            else:
+                # 回退到标准处理
+                return self.conv(x)
+        else:
+            # 训练模式：标准处理
+            x = self.conv(x)
+            new_shape = (self.max_value, x.shape[0] // self.max_value) + x.shape[1:]
+            x = x.view(new_shape).sum(dim=0)
+            return x
 
 
 # 添加时间维度
@@ -110,100 +177,193 @@ class MS_GetT(nn.Module):
 
 # 标准卷积层
 class MS_StandardConv(nn.Module):
-    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1):
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, max_value=4):
         super().__init__()
         self.c1 = c1
         self.c2 = c2
         self.s = s
-        self.conv = Conv2d_bn(c1, c2, k, s, autopad(k, p, d), g=g, bias=False)
-        self.lif = mem_update()
+        self.max_value = max_value
+        self.conv = Conv2d_bn(c1, c2, k, s, autopad(k, p, d), g=g, bias=False, max_value=max_value)
+        self.lif = mem_update(max_value=max_value)
+        self.inference_mode = False
+        
+    def set_inference_mode(self, mode=True):
+        self.inference_mode = mode
+        self.lif.set_inference_mode(mode)
+        self.conv.set_inference_mode(mode)
 
     def forward(self, x):
         T, B, C, H, W = x.shape
         H_new = int(H / self.s)
         W_new = int(W / self.s)
         
-        # 激活并展平前两个维度
-        spikes = self.lif(x)
-        flattened = spikes.flatten(0, 1)  # [T*B, C, H, W]
-        
-        # 应用卷积
-        convolved = self.conv(flattened)  # [T*B, C_out, H_new, W_new]
-        
-        # 检查输出大小
-        _, C_out, H_out, W_out = convolved.shape
-        
-        # 重塑回[T, B, C_out, H_new, W_new]形状
-        try:
-            reshaped = convolved.reshape(T, B, C_out, H_out, W_out)
-            return reshaped
-        except RuntimeError as e:
-            print(f"Reshape error: {e}")
-            print(f"Expected shape: [T={T}, B={B}, C_out={C_out}, H_out={H_out}, W_out={W_out}]")
-            print(f"Actual tensor size: {convolved.numel()}")
+        if self.inference_mode:
+            # 推理模式：使用稀疏二进制计算
+            binary_spikes = self.lif(x)
             
-            # 计算实际期望的维度
-            expected_elements = T * B * C_out * H_out * W_out
-            actual_elements = convolved.numel()
+            # 处理每个二进制脉冲
+            conv_outputs = []
+            for spike in binary_spikes:
+                flattened = spike.flatten(0, 1)  # [T*B, C, H, W]
+                convolved = self.conv(flattened, first_layer=False)
+                
+                # 重塑形状
+                _, C_out, H_out, W_out = convolved.shape
+                try:
+                    reshaped = convolved.reshape(T, B, C_out, H_out, W_out)
+                    conv_outputs.append(reshaped)
+                except RuntimeError as e:
+                    print(f"Reshape error in inference mode: {e}")
+                    return convolved.unsqueeze(0)
             
-            if actual_elements != expected_elements:
-                print(f"Dimension mismatch: expected {expected_elements} elements, got {actual_elements}")
+            # 合并所有输出
+            return sum(conv_outputs)
+        else:
+            # 训练模式：使用整数值脉冲
+            spikes = self.lif(x)
+            flattened = spikes.flatten(0, 1)  # [T*B, C, H, W]
+            
+            # 应用卷积
+            convolved = self.conv(flattened)
+            
+            # 检查输出大小
+            _, C_out, H_out, W_out = convolved.shape
+            
+            # 重塑回[T, B, C_out, H_new, W_new]形状
+            try:
+                reshaped = convolved.reshape(T, B, C_out, H_out, W_out)
+                return reshaped
+            except RuntimeError as e:
+                print(f"Reshape error: {e}")
+                print(f"Expected shape: [T={T}, B={B}, C_out={C_out}, H_out={H_out}, W_out={W_out}]")
+                print(f"Actual tensor size: {convolved.numel()}")
                 
-                # 尝试推断正确的维度
-                if actual_elements % (B * C_out * H_out * W_out) == 0:
-                    T_actual = actual_elements // (B * C_out * H_out * W_out)
-                    print(f"Inferred T = {T_actual} instead of {T}")
-                    return convolved.reshape(T_actual, B, C_out, H_out, W_out)
+                # 计算实际期望的维度
+                expected_elements = T * B * C_out * H_out * W_out
+                actual_elements = convolved.numel()
                 
-                # 如果无法推断，返回原始张量并添加一个批次维度
-                return convolved.unsqueeze(0)
+                if actual_elements != expected_elements:
+                    print(f"Dimension mismatch: expected {expected_elements} elements, got {actual_elements}")
+                    
+                    # 尝试推断正确的维度
+                    if actual_elements % (B * C_out * H_out * W_out) == 0:
+                        T_actual = actual_elements // (B * C_out * H_out * W_out)
+                        print(f"Inferred T = {T_actual} instead of {T}")
+                        return convolved.reshape(T_actual, B, C_out, H_out, W_out)
+                    
+                    # 如果无法推断，返回原始张量并添加一个批次维度
+                    return convolved.unsqueeze(0)
 
 
 # 无BN的标准卷积层
 class MS_StandardConvWithoutBN(nn.Module):
-    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True, max_value=4):
         super().__init__()
-        self.conv = Conv2d(c1, c2, k, s, autopad(k, p, d), g=g)
-        self.lif = mem_update()
+        self.conv = Conv2d(c1, c2, k, s, autopad(k, p, d), g=g, max_value=max_value)
+        self.lif = mem_update(max_value=max_value)
         self.s = s
+        self.inference_mode = False
+        
+    def set_inference_mode(self, mode=True):
+        self.inference_mode = mode
+        self.lif.set_inference_mode(mode)
+        self.conv.set_inference_mode(mode)
 
     def forward(self, x):
         T, B, C, H, W = x.shape
         H_new = int(H / self.s)
         W_new = int(W / self.s)
-        x = self.lif(x)
-        x = self.conv(x.flatten(0, 1)).reshape(T, B, -1, H_new, W_new)
-        return x
+        
+        if self.inference_mode:
+            # 推理模式
+            binary_spikes = self.lif(x)
+            outputs = []
+            
+            for spike in binary_spikes:
+                flattened = spike.flatten(0, 1)
+                convolved = self.conv(flattened)
+                try:
+                    reshaped = convolved.reshape(T, B, -1, H_new, W_new)
+                    outputs.append(reshaped)
+                except RuntimeError:
+                    outputs.append(convolved.unsqueeze(0))
+            
+            return sum(outputs)
+        else:
+            # 训练模式
+            x = self.lif(x)
+            x = self.conv(x.flatten(0, 1)).reshape(T, B, -1, H_new, W_new)
+            return x
 
 
 # 下采样层
 class MS_DownSampling(nn.Module):
-    def __init__(self, in_channels=2, embed_dims=256, kernel_size=3, stride=2, padding=1, first_layer=True):
+    def __init__(self, in_channels=2, embed_dims=256, kernel_size=3, stride=2, padding=1, first_layer=True, max_value=4):
         super().__init__()
-        self.encode_conv = Conv2d_bn(in_channels, embed_dims, k=kernel_size, s=stride, p=padding)
+        self.encode_conv = Conv2d_bn(in_channels, embed_dims, k=kernel_size, s=stride, p=padding, max_value=max_value)
+        self.first_layer = first_layer
         if not first_layer:
-            self.encode_lif = mem_update()
+            self.encode_lif = mem_update(max_value=max_value)
+        self.inference_mode = False
+        
+    def set_inference_mode(self, mode=True):
+        self.inference_mode = mode
+        self.encode_conv.set_inference_mode(mode)
+        if not self.first_layer and hasattr(self, "encode_lif"):
+            self.encode_lif.set_inference_mode(mode)
 
     def forward(self, x):
         T, B, _, _, _ = x.shape
-        if hasattr(self, "encode_lif"):  # 如果不是第一层
-            x = self.encode_lif(x)
-            x = self.encode_conv(x.flatten(0, 1), first_layer=False)
+        
+        if self.inference_mode:
+            if not self.first_layer and hasattr(self, "encode_lif"):
+                # 非第一层，使用LIF生成二进制脉冲
+                binary_spikes = self.encode_lif(x)
+                
+                outputs = []
+                for spike in binary_spikes:
+                    flattened = spike.flatten(0, 1)
+                    conv_out = self.encode_conv(flattened, first_layer=False)
+                    H, W = conv_out.shape[-2], conv_out.shape[-1]
+                    try:
+                        reshaped = conv_out.reshape(T, B, -1, H, W)
+                        outputs.append(reshaped)
+                    except RuntimeError:
+                        outputs.append(conv_out.unsqueeze(0))
+                
+                return sum(outputs)
+            else:
+                # 第一层，直接应用卷积
+                x = self.encode_conv(x.flatten(0, 1), first_layer=True)
+                H, W = x.shape[-2], x.shape[-1]
+                return x.reshape(T, B, -1, H, W).contiguous()
         else:
-            x = self.encode_conv(x.flatten(0, 1), first_layer=True)
-        H, W = x.shape[-2], x.shape[-1]
-        x = x.reshape(T, B, -1, H, W).contiguous()
-        return x
+            # 训练模式：原始逻辑
+            if hasattr(self, "encode_lif") and not self.first_layer:
+                x = self.encode_lif(x)
+                x = self.encode_conv(x.flatten(0, 1), first_layer=False)
+            else:
+                x = self.encode_conv(x.flatten(0, 1), first_layer=True)
+            
+            H, W = x.shape[-2], x.shape[-1]
+            x = x.reshape(T, B, -1, H, W).contiguous()
+            return x
 
 
 # 标准瓶颈模块
 class Bottleneck(nn.Module):
-    def __init__(self, c1, c2, shortcut=True, g=1, k=(3, 3), e=0.5):
+    def __init__(self, c1, c2, shortcut=True, g=1, k=(3, 3), e=0.5, max_value=4):
         super().__init__()
         c_ = int(c2 * e)  # hidden channels
-        self.cv1 = MS_StandardConv(c1, c_, k[0], 1)
-        self.cv2 = MS_StandardConv(c_, c2, k[1], 1, g=g)
+        self.cv1 = MS_StandardConv(c1, c_, k[0], 1, max_value=max_value)
+        self.cv2 = MS_StandardConv(c_, c2, k[1], 1, g=g, max_value=max_value)
         self.add = shortcut and c1 == c2
+        self.inference_mode = False
+        
+    def set_inference_mode(self, mode=True):
+        self.inference_mode = mode
+        self.cv1.set_inference_mode(mode)
+        self.cv2.set_inference_mode(mode)
 
     def forward(self, x):
         return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
@@ -211,12 +371,20 @@ class Bottleneck(nn.Module):
 
 # CSP Bottleneck 模块
 class MS_C2f(nn.Module):
-    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5, max_value=4):
         super().__init__()
         self.c = int(c2 * e)  # hidden channels
-        self.cv1 = MS_StandardConv(c1, 2 * self.c, 1, 1)
-        self.cv2 = MS_StandardConv((2 + n) * self.c, c2, 1)
-        self.m = nn.ModuleList(Bottleneck(self.c, self.c, shortcut, g, k=((3, 3), (3, 3)), e=1.0) for _ in range(n))
+        self.cv1 = MS_StandardConv(c1, 2 * self.c, 1, 1, max_value=max_value)
+        self.cv2 = MS_StandardConv((2 + n) * self.c, c2, 1, max_value=max_value)
+        self.m = nn.ModuleList(Bottleneck(self.c, self.c, shortcut, g, k=((3, 3), (3, 3)), e=1.0, max_value=max_value) for _ in range(n))
+        self.inference_mode = False
+        
+    def set_inference_mode(self, mode=True):
+        self.inference_mode = mode
+        self.cv1.set_inference_mode(mode)
+        self.cv2.set_inference_mode(mode)
+        for m in self.m:
+            m.set_inference_mode(mode)
 
     def forward(self, x):
         y = list(self.cv1(x).chunk(2, 2))
@@ -226,51 +394,178 @@ class MS_C2f(nn.Module):
 
 # 分离卷积
 class SepConv(nn.Module):
-    def __init__(self, dim, expansion_ratio=2, bias=True, kernel_size=3, padding=1):
+    def __init__(self, dim, expansion_ratio=2, bias=True, kernel_size=3, padding=1, max_value=4):
         super().__init__()
         padding = int((kernel_size - 1) / 2)
         med_channels = int(expansion_ratio * dim)
-        self.pwconv1 = Conv2d_bn(dim, med_channels, k=1, s=1, bias=bias)
-        self.dwconv2 = Conv2d_bn(med_channels, med_channels, k=kernel_size, p=padding, g=med_channels, bias=bias)
-        self.pwconv3 = Conv2d_bn(med_channels, dim, k=1, s=1, bias=bias)
-        self.dwconv4 = Conv2d_bn(dim, dim, 1, 1, 0, g=dim, bias=True)
+        self.pwconv1 = Conv2d_bn(dim, med_channels, k=1, s=1, bias=bias, max_value=max_value)
+        self.dwconv2 = Conv2d_bn(med_channels, med_channels, k=kernel_size, p=padding, g=med_channels, bias=bias, max_value=max_value)
+        self.pwconv3 = Conv2d_bn(med_channels, dim, k=1, s=1, bias=bias, max_value=max_value)
+        self.dwconv4 = Conv2d_bn(dim, dim, 1, 1, 0, g=dim, bias=True, max_value=max_value)
 
-        self.lif1 = mem_update()
-        self.lif2 = mem_update()
-        self.lif3 = mem_update()
-        self.lif4 = mem_update()
+        self.lif1 = mem_update(max_value=max_value)
+        self.lif2 = mem_update(max_value=max_value)
+        self.lif3 = mem_update(max_value=max_value)
+        self.lif4 = mem_update(max_value=max_value)
+        
+        self.inference_mode = False
+        
+    def set_inference_mode(self, mode=True):
+        self.inference_mode = mode
+        self.pwconv1.set_inference_mode(mode)
+        self.dwconv2.set_inference_mode(mode)
+        self.pwconv3.set_inference_mode(mode)
+        self.dwconv4.set_inference_mode(mode)
+        self.lif1.set_inference_mode(mode)
+        self.lif2.set_inference_mode(mode)
+        self.lif3.set_inference_mode(mode)
+        self.lif4.set_inference_mode(mode)
 
     def forward(self, x):
         T, B, C, H, W = x.shape
-        x = self.lif1(x)
-        x = self.pwconv1(x.flatten(0, 1)).reshape(T, B, -1, H, W)
-        x = self.lif2(x)
-        x = self.dwconv2(x.flatten(0, 1)).reshape(T, B, -1, H, W)
-        x = self.lif3(x)
-        x = self.pwconv3(x.flatten(0, 1)).reshape(T, B, -1, H, W)
-        x = self.lif4(x)
-        x = self.dwconv4(x.flatten(0, 1)).reshape(T, B, -1, H, W)
-        return x
+        
+        if self.inference_mode:
+            # 推理模式
+            # 第1层处理
+            binary_spikes1 = self.lif1(x)
+            outputs1 = []
+            for spike in binary_spikes1:
+                flattened = spike.flatten(0, 1)
+                output = self.pwconv1(flattened)
+                try:
+                    reshaped = output.reshape(T, B, -1, H, W)
+                    outputs1.append(reshaped)
+                except RuntimeError:
+                    outputs1.append(output.unsqueeze(0))
+            x = sum(outputs1)
+            
+            # 第2层处理
+            binary_spikes2 = self.lif2(x)
+            outputs2 = []
+            for spike in binary_spikes2:
+                flattened = spike.flatten(0, 1)
+                output = self.dwconv2(flattened)
+                try:
+                    reshaped = output.reshape(T, B, -1, H, W)
+                    outputs2.append(reshaped)
+                except RuntimeError:
+                    outputs2.append(output.unsqueeze(0))
+            x = sum(outputs2)
+            
+            # 第3层处理
+            binary_spikes3 = self.lif3(x)
+            outputs3 = []
+            for spike in binary_spikes3:
+                flattened = spike.flatten(0, 1)
+                output = self.pwconv3(flattened)
+                try:
+                    reshaped = output.reshape(T, B, -1, H, W)
+                    outputs3.append(reshaped)
+                except RuntimeError:
+                    outputs3.append(output.unsqueeze(0))
+            x = sum(outputs3)
+            
+            # 第4层处理
+            binary_spikes4 = self.lif4(x)
+            outputs4 = []
+            for spike in binary_spikes4:
+                flattened = spike.flatten(0, 1)
+                output = self.dwconv4(flattened)
+                try:
+                    reshaped = output.reshape(T, B, -1, H, W)
+                    outputs4.append(reshaped)
+                except RuntimeError:
+                    outputs4.append(output.unsqueeze(0))
+            x = sum(outputs4)
+            
+            return x
+        else:
+            # 训练模式：原始逻辑
+            x = self.lif1(x)
+            x = self.pwconv1(x.flatten(0, 1)).reshape(T, B, -1, H, W)
+            x = self.lif2(x)
+            x = self.dwconv2(x.flatten(0, 1)).reshape(T, B, -1, H, W)
+            x = self.lif3(x)
+            x = self.pwconv3(x.flatten(0, 1)).reshape(T, B, -1, H, W)
+            x = self.lif4(x)
+            x = self.dwconv4(x.flatten(0, 1)).reshape(T, B, -1, H, W)
+            return x
 
 
 # 重参数化卷积
 class RepConv(nn.Module):
-    def __init__(self, in_channel, out_channel, kernel_size=3, bias=True, group=1):
+    def __init__(self, in_channel, out_channel, kernel_size=3, bias=True, group=1, max_value=4):
         super().__init__()
-        self.conv1 = Conv2d_bn(in_channel, in_channel, 1, 1, 0, bias=True, g=group)
-        self.conv2 = Conv2d_bn(in_channel, in_channel, kernel_size, 1, 1, g=in_channel, bias=True)
-        self.conv3 = Conv2d_bn(in_channel, out_channel, 1, 1, 0, g=group, bias=True)
+        self.conv1 = Conv2d_bn(in_channel, in_channel, 1, 1, 0, bias=True, g=group, max_value=max_value)
+        self.conv2 = Conv2d_bn(in_channel, in_channel, kernel_size, 1, 1, g=in_channel, bias=True, max_value=max_value)
+        self.conv3 = Conv2d_bn(in_channel, out_channel, 1, 1, 0, g=group, bias=True, max_value=max_value)
 
-        self.lif1 = mem_update()
-        self.lif2 = mem_update()
-        self.lif3 = mem_update()
+        self.lif1 = mem_update(max_value=max_value)
+        self.lif2 = mem_update(max_value=max_value)
+        self.lif3 = mem_update(max_value=max_value)
+        
+        self.inference_mode = False
+        
+    def set_inference_mode(self, mode=True):
+        self.inference_mode = mode
+        self.conv1.set_inference_mode(mode)
+        self.conv2.set_inference_mode(mode)
+        self.conv3.set_inference_mode(mode)
+        self.lif1.set_inference_mode(mode)
+        self.lif2.set_inference_mode(mode)
+        self.lif3.set_inference_mode(mode)
 
     def forward(self, x):
         T, B, C, H, W = x.shape
-        x = self.conv1(self.lif1(x).flatten(0, 1)).reshape(T, B, -1, H, W)
-        x = self.conv2(self.lif2(x).flatten(0, 1)).reshape(T, B, -1, H, W)
-        x = self.conv3(self.lif3(x).flatten(0, 1)).reshape(T, B, -1, H, W)
-        return x
+        
+        if self.inference_mode:
+            # 推理模式
+            # 第1层处理
+            binary_spikes1 = self.lif1(x)
+            outputs1 = []
+            for spike in binary_spikes1:
+                flattened = spike.flatten(0, 1)
+                output = self.conv1(flattened)
+                try:
+                    reshaped = output.reshape(T, B, -1, H, W)
+                    outputs1.append(reshaped)
+                except RuntimeError:
+                    outputs1.append(output.unsqueeze(0))
+            x = sum(outputs1)
+            
+            # 第2层处理
+            binary_spikes2 = self.lif2(x)
+            outputs2 = []
+            for spike in binary_spikes2:
+                flattened = spike.flatten(0, 1)
+                output = self.conv2(flattened)
+                try:
+                    reshaped = output.reshape(T, B, -1, H, W)
+                    outputs2.append(reshaped)
+                except RuntimeError:
+                    outputs2.append(output.unsqueeze(0))
+            x = sum(outputs2)
+            
+            # 第3层处理
+            binary_spikes3 = self.lif3(x)
+            outputs3 = []
+            for spike in binary_spikes3:
+                flattened = spike.flatten(0, 1)
+                output = self.conv3(flattened)
+                try:
+                    reshaped = output.reshape(T, B, -1, H, W)
+                    outputs3.append(reshaped)
+                except RuntimeError:
+                    outputs3.append(output.unsqueeze(0))
+            x = sum(outputs3)
+            
+            return x
+        else:
+            # 训练模式：原始逻辑
+            x = self.conv1(self.lif1(x).flatten(0, 1)).reshape(T, B, -1, H, W)
+            x = self.conv2(self.lif2(x).flatten(0, 1)).reshape(T, B, -1, H, W)
+            x = self.conv3(self.lif3(x).flatten(0, 1)).reshape(T, B, -1, H, W)
+            return x
 
 
 # 添加层
@@ -284,13 +579,20 @@ class Add(nn.Module):
 
 # SNN卷积块
 class MS_ConvBlock(nn.Module):
-    def __init__(self, input_dim, mlp_ratio=4., sep_kernel_size=7, full=False):
+    def __init__(self, input_dim, mlp_ratio=4., sep_kernel_size=7, full=False, max_value=4):
         super().__init__()
-        self.Conv = SepConv(dim=input_dim, kernel_size=sep_kernel_size)
-        self.conv1 = RepConv(input_dim, int(input_dim * mlp_ratio))
-        self.conv2 = RepConv(int(input_dim * mlp_ratio), input_dim)
+        self.Conv = SepConv(dim=input_dim, kernel_size=sep_kernel_size, max_value=max_value)
+        self.conv1 = RepConv(input_dim, int(input_dim * mlp_ratio), max_value=max_value)
+        self.conv2 = RepConv(int(input_dim * mlp_ratio), input_dim, max_value=max_value)
         self.add1 = Add()
         self.add2 = Add()
+        self.inference_mode = False
+        
+    def set_inference_mode(self, mode=True):
+        self.inference_mode = mode
+        self.Conv.set_inference_mode(mode)
+        self.conv1.set_inference_mode(mode)
+        self.conv2.set_inference_mode(mode)
 
     def forward(self, x):
         T, B, C, H, W = x.shape
@@ -304,14 +606,21 @@ class MS_ConvBlock(nn.Module):
 
 # 标准SNN卷积块
 class MS_AllConvBlock(nn.Module):
-    def __init__(self, input_dim, mlp_ratio=4., sep_kernel_size=7, group=False):
+    def __init__(self, input_dim, mlp_ratio=4., sep_kernel_size=7, group=False, max_value=4):
         super().__init__()
-        self.Conv = SepConv(dim=input_dim, kernel_size=sep_kernel_size)
+        self.Conv = SepConv(dim=input_dim, kernel_size=sep_kernel_size, max_value=max_value)
         self.mlp_ratio = mlp_ratio
-        self.conv1 = MS_StandardConv(input_dim, int(input_dim * mlp_ratio), 3)
-        self.conv2 = MS_StandardConv(int(input_dim * mlp_ratio), input_dim, 3)
+        self.conv1 = MS_StandardConv(input_dim, int(input_dim * mlp_ratio), 3, max_value=max_value)
+        self.conv2 = MS_StandardConv(int(input_dim * mlp_ratio), input_dim, 3, max_value=max_value)
         self.add1 = Add()
         self.add2 = Add()
+        self.inference_mode = False
+        
+    def set_inference_mode(self, mode=True):
+        self.inference_mode = mode
+        self.Conv.set_inference_mode(mode)
+        self.conv1.set_inference_mode(mode)
+        self.conv2.set_inference_mode(mode)
 
     def forward(self, x):
         T, B, C, H, W = x.shape
@@ -335,30 +644,45 @@ class Concat(nn.Module):
 
 # SPPF层
 class SpikeSPPF(nn.Module):
-    def __init__(self, c1, c2, k=5):
+    def __init__(self, c1, c2, k=5, max_value=4):
         super().__init__()
         c_ = c1 // 2  # hidden channels
-        self.cv1 = MS_StandardConv(c1, c_, 1, 1)
-        self.cv2 = MS_StandardConv(c_ * 4, c2, 1, 1)
+        self.cv1 = MS_StandardConv(c1, c_, 1, 1, max_value=max_value)
+        self.cv2 = MS_StandardConv(c_ * 4, c2, 1, 1, max_value=max_value)
         self.m1 = nn.MaxPool2d(kernel_size=k, stride=1, padding=k // 2)
         self.m2 = nn.MaxPool2d(kernel_size=k, stride=1, padding=k // 2)
         self.m3 = nn.MaxPool2d(kernel_size=k, stride=1, padding=k // 2)
         self.concat = Concat(2)
+        self.inference_mode = False
+        
+    def set_inference_mode(self, mode=True):
+        self.inference_mode = mode
+        self.cv1.set_inference_mode(mode)
+        self.cv2.set_inference_mode(mode)
 
     def forward(self, x):
         x = self.cv1(x)
         with warnings.catch_warnings():
             T, B, C, H, W = x.shape
             warnings.simplefilter('ignore')
-            y1 = self.m1(x.flatten(0, 1)).reshape(T, B, -1, H, W)
-            y2 = self.m2(y1.flatten(0, 1)).reshape(T, B, -1, H, W)
-            y3 = self.m3(y2.flatten(0, 1)).reshape(T, B, -1, H, W)
+            
+            if self.inference_mode:
+                # 推理模式
+                y1 = self.m1(x.flatten(0, 1)).reshape(T, B, -1, H, W)
+                y2 = self.m2(y1.flatten(0, 1)).reshape(T, B, -1, H, W)
+                y3 = self.m3(y2.flatten(0, 1)).reshape(T, B, -1, H, W)
+            else:
+                # 训练模式
+                y1 = self.m1(x.flatten(0, 1)).reshape(T, B, -1, H, W)
+                y2 = self.m2(y1.flatten(0, 1)).reshape(T, B, -1, H, W)
+                y3 = self.m3(y2.flatten(0, 1)).reshape(T, B, -1, H, W)
+                
             return self.cv2(self.concat((x, y1, y2, y3)))
 
 
 # 事件处理的SpikeYOLO Backbone
 class EventSNNBackbone(nn.Module):
-    def __init__(self, input_channels=2, scale='n', T=4):
+    def __init__(self, input_channels=2, scale='n', T=4, max_value=4):
         super().__init__()
         # 根据scale确定网络深度和宽度
         scales = {
@@ -372,6 +696,7 @@ class EventSNNBackbone(nn.Module):
         
         # 初始通道设置
         base_channels = int(64 * width_scale)
+        self.max_value = max_value
         
         # 添加时间维度
         self.get_t = MS_GetT(input_channels, T=T)
@@ -381,36 +706,36 @@ class EventSNNBackbone(nn.Module):
         # 目标尺寸: [14, 20]和[7, 10]
         
         # Stage 1: 输入层 -> [108, 160]
-        self.stage1_down = MS_DownSampling(input_channels, base_channels, 3, 2, 1, True)
+        self.stage1_down = MS_DownSampling(input_channels, base_channels, 3, 2, 1, True, max_value=max_value)
         self.stage1_blocks = nn.Sequential(*[
-            MS_C2f(base_channels, base_channels, n=1, shortcut=True) 
+            MS_C2f(base_channels, base_channels, n=1, shortcut=True, max_value=max_value) 
             for _ in range(int(3 * depth_scale))
         ])
         
         # Stage 2: [108, 160] -> [54, 80]
-        self.stage2_down = MS_StandardConv(base_channels, base_channels*2, 3, 2)
+        self.stage2_down = MS_StandardConv(base_channels, base_channels*2, 3, 2, max_value=max_value)
         self.stage2_blocks = nn.Sequential(*[
-            MS_C2f(base_channels*2, base_channels*2, n=1, shortcut=True) 
+            MS_C2f(base_channels*2, base_channels*2, n=1, shortcut=True, max_value=max_value) 
             for _ in range(int(6 * depth_scale))
         ])
         
         # Stage 3: [54, 80] -> [27, 40]
-        self.stage3_down = MS_StandardConv(base_channels*2, base_channels*4, 3, 2)
+        self.stage3_down = MS_StandardConv(base_channels*2, base_channels*4, 3, 2, max_value=max_value)
         self.stage3_blocks = nn.Sequential(*[
-            MS_C2f(base_channels*4, base_channels*4, n=1, shortcut=True) 
+            MS_C2f(base_channels*4, base_channels*4, n=1, shortcut=True, max_value=max_value) 
             for _ in range(int(6 * depth_scale))
         ])
         
         # Stage 4: [27, 40] -> [14, 20] (匹配RGB分支的第一个输出)
-        self.stage4_down = MS_StandardConv(base_channels*4, base_channels*8, 3, 2)
+        self.stage4_down = MS_StandardConv(base_channels*4, base_channels*8, 3, 2, max_value=max_value)
         self.stage4_blocks = nn.Sequential(*[
-            MS_C2f(base_channels*8, base_channels*8, n=1, shortcut=True) 
+            MS_C2f(base_channels*8, base_channels*8, n=1, shortcut=True, max_value=max_value) 
             for _ in range(int(3 * depth_scale))
         ])
         
         # Stage 5: [14, 20] -> [7, 10] (匹配RGB分支的第二个输出)
-        self.stage5_down = MS_StandardConv(base_channels*8, base_channels*8, 3, 2)
-        self.stage5_blocks = SpikeSPPF(base_channels*8, base_channels*8, 5)
+        self.stage5_down = MS_StandardConv(base_channels*8, base_channels*8, 3, 2, max_value=max_value)
+        self.stage5_blocks = SpikeSPPF(base_channels*8, base_channels*8, 5, max_value=max_value)
         
         # 调整通道数，使其与RGB分支兼容
         self.out_conv4 = nn.Conv2d(base_channels*8, 256, kernel_size=1)
@@ -427,6 +752,36 @@ class EventSNNBackbone(nn.Module):
         
         # 步长
         self.strides = [2, 4, 8, 16, 32]
+        
+        # 推理模式标志
+        self.inference_mode = False
+        
+    def set_inference_mode(self, mode=True):
+        """设置推理模式"""
+        self.inference_mode = mode
+        
+        # 递归设置所有子模块的推理模式
+        def set_mode_recursive(module):
+            for name, child in module.named_children():
+                if hasattr(child, 'set_inference_mode'):
+                    child.set_inference_mode(mode)
+                set_mode_recursive(child)
+        
+        # 设置所有阶段的推理模式
+        self.stage1_down.set_inference_mode(mode)
+        set_mode_recursive(self.stage1_blocks)
+        
+        self.stage2_down.set_inference_mode(mode)
+        set_mode_recursive(self.stage2_blocks)
+        
+        self.stage3_down.set_inference_mode(mode)
+        set_mode_recursive(self.stage3_blocks)
+        
+        self.stage4_down.set_inference_mode(mode)
+        set_mode_recursive(self.stage4_blocks)
+        
+        self.stage5_down.set_inference_mode(mode)
+        self.stage5_blocks.set_inference_mode(mode)
 
     def forward(self, x):
         """
@@ -459,9 +814,17 @@ class EventSNNBackbone(nn.Module):
         x = self.stage5_down(x4)
         x5 = self.stage5_blocks(x)
         
-        # 调整通道数以匹配RGB分支
-        x4_out = self.out_conv4(x4.mean(0))  # [T,B,C,H,W] -> [B,256,H,W]
-        x5_out = self.out_conv5(x5.mean(0))  # [T,B,C,H,W] -> [B,256,H,W]
+        # 根据模式处理最终输出
+        if self.inference_mode:
+            # 推理模式：保持时间维度的分离结构
+            # 为简化起见，我们在这里仍然使用平均池化
+            # 在实际部署中，应该实现真正的稀疏计算
+            x4_out = self.out_conv4(x4.mean(0))
+            x5_out = self.out_conv5(x5.mean(0))
+        else:
+            # 训练模式：对时间维度取平均
+            x4_out = self.out_conv4(x4.mean(0))  # [T,B,C,H,W] -> [B,256,H,W]
+            x5_out = self.out_conv5(x5.mean(0))  # [T,B,C,H,W] -> [B,256,H,W]
         
         # 返回所有5个特征层，但最后两层已调整通道
         return [x1, x2, x3, x4_out, x5_out]
@@ -520,19 +883,21 @@ def voxelize_events(data, height=215, width=320):
     return event_tensor
 
 class EventProcessor(nn.Module):
-    def __init__(self, args, height=215, width=320):
+    def __init__(self, args, height=215, width=320, max_value=4):
         super().__init__()
         # 创建SNN backbone
         self.backbone = EventSNNBackbone(
             input_channels=2,
             scale=getattr(args, 'snn_scale', 'n'),
-            T=getattr(args, 'snn_timesteps', 4)
+            T=getattr(args, 'snn_timesteps', 4),
+            max_value=max_value
         )
         
         self.height = height
         self.width = width
         self.batch_size = getattr(args, 'batch_size', 8)  # 添加这一行，设置batch_size
         self.num_scales = getattr(args, 'num_scales', 2)
+        self.max_value = max_value
         
         # 池化大小计算
         pooling_dim = getattr(args, 'pooling_dim_at_output', '5x7')
@@ -543,6 +908,14 @@ class EventProcessor(nn.Module):
         
         # 步长
         self.strides = self.backbone.strides[-self.num_scales:]
+        
+        # 推理模式标志
+        self.inference_mode = False
+        
+    def set_inference_mode(self, mode=True):
+        """设置为推理模式"""
+        self.inference_mode = mode
+        self.backbone.set_inference_mode(mode)
 
     def forward(self, data):
         """
@@ -568,6 +941,9 @@ class EventProcessor(nn.Module):
             event_tensor = voxelize_events(data, self.height, self.width)
             print(f"Voxelized event tensor shape: {event_tensor.shape}")
             print(f"Event tensor stats - min: {event_tensor.min()}, max: {event_tensor.max()}, mean: {event_tensor.mean()}")
+            
+            # 设置backbone的推理模式
+            self.backbone.set_inference_mode(self.inference_mode)
             
             # 通过SNN backbone处理体素化事件数据
             features = self.backbone(event_tensor)
@@ -660,30 +1036,6 @@ class EventProcessor(nn.Module):
                 outputs.append(out)
             
             return outputs
-    
-    # def forward(self, data):
-    #     # 体素化事件数据
-    #     event_tensor = voxelize_events(data, self.height, self.width)
-        
-    #     # 提取特征
-    #     features = self.backbone(event_tensor)
-        
-    #     # 将特征转换为与原始DAGR兼容的格式
-    #     outputs = []
-    #     for i, feat in enumerate(features[-self.num_scales:]):
-    #         # 创建一个类似图数据的对象
-    #         out = Data()
-            
-    #         # 特征已经在backbone中处理为[B,C,H,W]格式
-    #         out.x = feat
-            
-    #         # 设置池化大小
-    #         pool_idx = i + (5 - self.num_scales)
-    #         out.pooling = self.poolings[pool_idx]
-            
-    #         outputs.append(out)
-        
-    #     return outputs
     
     def get_output_sizes(self):
         """返回特征图的大小"""

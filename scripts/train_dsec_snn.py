@@ -3,7 +3,7 @@ import wandb
 from pathlib import Path
 import argparse
 import traceback
-
+import torch
 from torch_geometric.data import DataLoader
 
 from dagr.utils.logging import Checkpointer, set_up_logging_directory, log_hparams
@@ -42,6 +42,12 @@ def debug_snn(model, data):
     print("\n===== DEBUGGING SNN EVENT BRANCH =====")
     model.eval()
     
+    # 保存原始推理模式状态
+    original_inference_mode = False
+    if hasattr(model, 'event_processor'):
+        if hasattr(model.event_processor, 'inference_mode'):
+            original_inference_mode = model.event_processor.inference_mode
+    
     with torch.no_grad():
         # 处理单个样本
         if isinstance(data, list):
@@ -56,6 +62,11 @@ def debug_snn(model, data):
         print(f"Input data attributes: {sample.__dict__.keys()}")
         
         try:
+            # 设置为训练模式进行测试
+            if hasattr(model, 'event_processor') and hasattr(model.event_processor, 'set_inference_mode'):
+                model.event_processor.set_inference_mode(False)
+                print("\n----- Testing in TRAINING mode -----")
+            
             # 运行SNN处理
             if hasattr(model, 'event_processor'):
                 event_features = model.event_processor(sample)
@@ -64,16 +75,37 @@ def debug_snn(model, data):
                     print(f"Feature {i} shape: {feat.x.shape if hasattr(feat, 'x') else 'No x attribute'}")
             else:
                 print("Model has no event_processor attribute. Using regular forward.")
-                
-            # 运行完整推理
-            detections, targets = model(sample)
-            print(f"Detections length: {len(detections)}")
-            #if len(detections) > 0:
-                #print(f"First detection shape: {detections[0].shape if hasattr(detections[0], 'shape') else 'Not a tensor'}")
             
+            # 运行完整推理(训练模式)
+            detections, targets = model(sample)
+            print(f"Training mode - Detections length: {len(detections)}")
+            
+            # 设置为推理模式进行测试
+            if hasattr(model, 'event_processor') and hasattr(model.event_processor, 'set_inference_mode'):
+                model.event_processor.set_inference_mode(True)
+                print("\n----- Testing in INFERENCE mode -----")
+                
+                # 再次运行SNN处理(推理模式)
+                event_features = model.event_processor(sample)
+                print(f"SNN output features (inference mode): {len(event_features)}")
+                for i, feat in enumerate(event_features):
+                    print(f"Feature {i} shape: {feat.x.shape if hasattr(feat, 'x') else 'No x attribute'}")
+                
+                # 运行完整推理(推理模式)
+                detections, targets = model(sample)
+                print(f"Inference mode - Detections length: {len(detections)}")
+            
+            # 恢复原始状态
+            if hasattr(model, 'event_processor') and hasattr(model.event_processor, 'set_inference_mode'):
+                model.event_processor.set_inference_mode(original_inference_mode)
+                
             print("SNN event branch test passed!")
             return True
         except Exception as e:
+            # 确保恢复原始状态
+            if hasattr(model, 'event_processor') and hasattr(model.event_processor, 'set_inference_mode'):
+                model.event_processor.set_inference_mode(original_inference_mode)
+                
             print(f"SNN event branch test failed: {e}")
             traceback.print_exc()
             return False
@@ -90,6 +122,10 @@ def train(loader: DataLoader,
           run_name=""):
 
     model.train()
+    # 设置为训练模式
+    if hasattr(model, 'event_processor'):
+        model.event_processor.set_inference_mode(False)
+
     total_loss = 0.0
     num_batches = 0
 
@@ -156,6 +192,9 @@ def run_test(loader: DataLoader,
          dataset="gen1"):
 
     model.eval()
+    # 设置为推理模式
+    if hasattr(model, 'event_processor'):
+        model.event_processor.set_inference_mode(True)
 
     mapcalc = DetectionBuffer(height=loader.dataset.height, width=loader.dataset.width, classes=loader.dataset.classes)
 
