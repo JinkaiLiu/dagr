@@ -167,29 +167,7 @@ class DSEC(Dataset):
         image_0 = self.dataset.get_image(image_index_0, directory_name=dataset.root.name)
         image_0 = self.preprocess_image(image_0)
 
-        try:
-            events = self.dataset.get_events(image_index_0, directory_name=dataset.root.name)
-        except KeyError as e:
-            # Debug output to identify which H5 file is missing keys (e.g., 'ms_to_idx')
-            try:
-                event_file_path = str(dataset.events.event_file)
-            except Exception:
-                try:
-                    event_file_path = str(dataset.root / "left/events_2x.h5")
-                except Exception:
-                    event_file_path = "<unknown>"
-
-            print(
-                f"[DSEC Debug] KeyError while reading events from H5.\n"
-                f"  directory_name: {dataset.root.name}\n"
-                f"  directory_root: {dataset.root}\n"
-                f"  event_file: {event_file_path}\n"
-                f"  image_index_0: {image_index_0}\n"
-                f"  image_ts_0: {image_ts_0}, image_ts_1: {image_ts_1}\n"
-                f"  error: {repr(e)}",
-                flush=True,
-            )
-            raise
+        events = self.dataset.get_events(image_index_0, directory_name=dataset.root.name)
 
         if self.num_us >= 0:
             image_ts_1 = image_ts_0 + self.num_us

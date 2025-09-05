@@ -9,7 +9,6 @@ radius: 0.01
 time_window_us: 1000000
 max_neighbors: 16
 n_nodes: 50000
-use_snn_backbone: true
 
 batch_size: 64
 

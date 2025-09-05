@@ -3,7 +3,7 @@ import tqdm
 import wandb
 import os
 os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
-import hdf5plugin
+
 from torch_geometric.data import DataLoader
 from pprint import pprint
 
@@ -70,28 +70,13 @@ if __name__ == '__main__':
 
     print("init net")
     model = DAGR(args, height=test_dataset.height, width=test_dataset.width)
-    model = torch.nn.DataParallel(model)
     model = model.cuda()
     ema = ModelEMA(model)
 
     assert "checkpoint" in args
     checkpoint = torch.load(args.checkpoint)
-
-    ema_state_dict = checkpoint['ema']
-    if hasattr(ema.ema, 'module'):
-        if not any(k.startswith('module.') for k in ema_state_dict.keys()):
-            ema_state_dict = {f'module.{k}': v for k, v in ema_state_dict.items()}
-            print("Added 'module.' prefix to checkpoint keys")
-
-    ema.ema.load_state_dict(ema_state_dict)
-    #ema.ema.load_state_dict(checkpoint['ema'])
-
-    if hasattr(ema.ema, 'module'):
-        #DataParallel used
-        ema.ema.module.cache_luts(radius=args.radius, height=test_dataset.height, width=test_dataset.width)
-    else:
-        #DataParallel not used
-        ema.ema.cache_luts(radius=args.radius, height=test_dataset.height, width=test_dataset.width)
+    ema.ema.load_state_dict(checkpoint['ema'])
+    ema.ema.cache_luts(radius=args.radius, height=test_dataset.height, width=test_dataset.width)
 
     detections = []
     with torch.no_grad():

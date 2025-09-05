@@ -30,14 +30,6 @@ class MySplineConv(SplineConv):
         edge_attr = dxy.view((2,-1)).t()
 
         bil_w, indices = spline_basis(edge_attr.to(self.weight.data.device), self.kernel_size, self.is_open_spline, self.degree)
-
-        #device = self.weight.device
-       # cpu_bil_w = bil_w.cpu()
-      #  cpu_weight = self.weight.cpu()
-     #   cpu_indices = indices.cpu()
-    #    lut_weights = (cpu_bil_w[...,None,None] * cpu_weight[cpu_indices]).sum(1)
-   #     lut_weights = lut_weights.to(device)
-
         lut_weights = (bil_w[...,None,None] * self.weight[indices]).sum(1)
         _, cin, cout = lut_weights.shape
         self.lut_weights = lut_weights.view((2 * rx + 1, 2 * ry + 1, cin, cout))
@@ -78,19 +70,7 @@ class MySplineConv(SplineConv):
             out = torch.zeros((x.size(0), self.out_channels), dtype=x.dtype, device=x.device)
 
         if x is not None and self.root_weight:
-            try:
-                out += self.lin(x)
-            except RuntimeError as e:
-                if "CUBLAS" in str(e):
-                    # 使用 CPU 计算避免 CUBLAS 问题
-                    x_cpu = x.cpu()
-                    lin_cpu = self.lin.cpu()
-                    result_cpu = lin_cpu(x_cpu)
-                    out += result_cpu.to(x.device)
-                    # 将 lin 移回 GPU
-                    self.lin = self.lin.to(x.device)
-                else:
-                    raise e
+            out += self.lin(x)
 
         if self.bias is not None:
             out += self.bias

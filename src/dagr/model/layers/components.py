@@ -18,20 +18,7 @@ class Linear(torch.nn.Module):
         self.mlp = torch.nn.Linear(ic, oc, bias=bias)
 
     def forward(self, data: Data):
-        try:
-            data.x = self.mlp(data.x)
-        except RuntimeError as e:
-            if "CUBLAS" in str(e):
-                # CPU 备用计算
-                device = data.x.device
-                x_cpu = data.x.cpu()
-                mlp_cpu = self.mlp.cpu()
-                result_cpu = mlp_cpu(x_cpu)
-                data.x = result_cpu.to(device)
-                # 将 mlp 移回 GPU
-                self.mlp = self.mlp.to(device)
-            else:
-                raise e
+        data.x = self.mlp(data.x)
         return data
 
 

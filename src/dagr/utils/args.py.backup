@@ -49,11 +49,6 @@ def BASE_FLAGS():
 
     parser.add_argument('--aug_p_flip', default=argparse.SUPPRESS, type=float)
 
-    # SNN backbone options
-    parser.add_argument("--use_snn_backbone", action="store_true", help="Enable SNN backbone defined by a YAML config")
-    parser.add_argument("--snn_yaml_path", default=argparse.SUPPRESS, type=str, help="Path to SNN YAML config file")
-    parser.add_argument("--snn_scale", default=argparse.SUPPRESS, type=str, help="Model scale for SNN backbone (e.g., s/m/l)")
-
     return parser
 
 def FLAGS():
@@ -68,9 +63,6 @@ def FLAGS():
     parser.add_argument('--tot_num_epochs', default=argparse.SUPPRESS, type=int)
 
     parser.add_argument('--run_test', action="store_true")
-
-    # experiment trend: controls data subsampling and evaluation frequency
-    parser.add_argument('--exp_trend', default='fast', type=str, choices=['fast', 'mid', 'full'])
 
     parser.add_argument('--num_interframe_steps', type=int, default=10)
 

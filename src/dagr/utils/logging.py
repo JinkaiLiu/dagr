@@ -26,7 +26,7 @@ class Checkpointer:
         checkpoint = self.search_for_checkpoint(folder, best=resume_from_best)
         if checkpoint is not None:
             print(f"Found existing checkpoint at {checkpoint}, resuming...")
-            return self.restore_checkpoint(folder, best=resume_from_best)
+            self.restore_checkpoint(folder, best=resume_from_best)
 
     def mAP_from_checkpoint_name(self, checkpoint_name: Path):
         return float(str(checkpoint_name).split("_")[-1].split(".pth")[0])
@@ -57,49 +57,17 @@ class Checkpointer:
         assert path is not None, "No checkpoint found in {}".format(checkpoint_directory)
         print("Restoring checkpoint from {}".format(path))
         checkpoint = torch.load(path)
+
         checkpoint['model'] = self.fix_checkpoint(checkpoint['model'])
         checkpoint['ema'] = self.fix_checkpoint(checkpoint['ema'])
-    
+
         if self.ema is not None:
             self.ema.ema.load_state_dict(checkpoint.get('ema', checkpoint['model']))
             self.ema.updates = checkpoint.get('ema_updates', 0)
-    
-        # 恢复模型权重
         self.restore_if_not_none(self.model, checkpoint['model'])
-    
-        # 尝试恢复优化器状态，如果失败则跳过
-        try:
-            self.restore_if_not_none(self.optimizer, checkpoint['optimizer'])
-            print("[INFO] Optimizer state restored successfully")
-        except (ValueError, RuntimeError) as e:
-            print(f"[WARNING] Could not restore optimizer state: {e}")
-            print("[INFO] Optimizer will restart from initial state")
-    
-        # 尝试恢复学习率调度器
-        try:
-            self.restore_if_not_none(self.scheduler, checkpoint['scheduler'])
-            print("[INFO] Scheduler state restored successfully")
-        except (ValueError, RuntimeError) as e:
-            print(f"[WARNING] Could not restore scheduler state: {e}")
-            print("[INFO] Scheduler will restart from initial state")
-    
+        self.restore_if_not_none(self.optimizer, checkpoint['optimizer'])
+        self.restore_if_not_none(self.scheduler, checkpoint['scheduler'])
         return checkpoint['epoch']
-    #def restore_checkpoint(self, checkpoint_directory, best=False):
-    #    path = self.search_for_checkpoint(checkpoint_directory, best)
-    #    assert path is not None, "No checkpoint found in {}".format(checkpoint_directory)
-    #    print("Restoring checkpoint from {}".format(path))
-    #    checkpoint = torch.load(path)
-
-    #    checkpoint['model'] = self.fix_checkpoint(checkpoint['model'])
-    #    checkpoint['ema'] = self.fix_checkpoint(checkpoint['ema'])
-
-    #    if self.ema is not None:
-    #        self.ema.ema.load_state_dict(checkpoint.get('ema', checkpoint['model']))
-    #        self.ema.updates = checkpoint.get('ema_updates', 0)
-    #    self.restore_if_not_none(self.model, checkpoint['model'])
-    #    self.restore_if_not_none(self.optimizer, checkpoint['optimizer'])
-    #    self.restore_if_not_none(self.scheduler, checkpoint['scheduler'])
-    #    return checkpoint['epoch']
 
     def fix_checkpoint(self, state_dict):
         return state_dict
@@ -121,7 +89,16 @@ class Checkpointer:
 
     def process(self, data: Dict[str, float], epoch: int):
         mAP = data['mAP']
-        print(f"Epoch {epoch}: mAP = {mAP:.4f}, mAP_max = {self.mAP_max:.4f}")
+        summary_keys = ['mAP', 'mAP_50', 'mAP_75', 'mAP_S', 'mAP_M', 'mAP_L']
+        summary_parts = []
+        for k in summary_keys:
+            if k in data:
+                try:
+                    summary_parts.append(f"{k}={data[k]:.4f}")
+                except Exception:
+                    summary_parts.append(f"{k}={data[k]}")
+        if summary_parts:
+            print(f"[Eval][Epoch {epoch}] " + ", ".join(summary_parts), flush=True)
         data = {f"validation/metric/{k}": v for k, v in data.items()}
         data['epoch'] = epoch
         wandb.log(data)
@@ -129,14 +106,14 @@ class Checkpointer:
         if mAP > self.mAP_max:
             self.checkpoint(epoch, name=f"best_model_mAP_{mAP}")
             self.mAP_max = mAP
-            print(f"new best model! mAP: {mAP:.4f}")
+
 
 def set_up_logging_directory(dataset, task, output_directory, exp_name="temp"):
     project = f"low_latency-{dataset}-{task}"
 
     output_directory = output_directory / dataset / task
     output_directory.mkdir(parents=True, exist_ok=True)
-    wandb.init(project=project, id=exp_name, entity="jinkai-liu-technical-university-of-munich", save_code=True, dir=str(output_directory))
+    wandb.init(project=project, id=exp_name, entity="danielgehrig18", save_code=True, dir=str(output_directory))
 
     name = wandb.run.id
     output_directory = output_directory / name
