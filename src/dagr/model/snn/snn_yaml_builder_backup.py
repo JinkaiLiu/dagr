@@ -1,12 +1,11 @@
 import yaml
-from typing import List, Tuple, Optional
+from typing import List, Tuple
 
 import torch
 import torch.nn as nn
 
 from dagr.model.snn.snn_modules import (
     MS_GetT,
-    MS_GetT_Voxel,
     MS_CancelT,
     MS_DownSampling,
     MS_AllConvBlock,
@@ -20,9 +19,9 @@ def _make_divisible(v: int, divisor: int = 8) -> int:
     return int((v + divisor - 1) // divisor) * divisor
 
 
-def parse_model(d: dict, ch: int, scale: str = 's', verbose: bool = False, height: int = None, width: int = None) -> Tuple[nn.Sequential, List[int], List[int]]:
+def parse_model(d: dict, ch: int, scale: str = 's', verbose: bool = False) -> Tuple[nn.Sequential, List[int], List[int]]:
     scales = d.get('scales') or {}
-    depth_mult, width_mult, max_channels = scales.get(scale, (1.0, 1.0, float('inf')))
+    depth, width, max_channels = scales.get(scale, (1.0, 1.0, float('inf')))
 
     layers: list = []
     save: list = []
@@ -35,7 +34,7 @@ def parse_model(d: dict, ch: int, scale: str = 's', verbose: bool = False, heigh
             raise NotImplementedError('nn.* modules are not required in backbone for this integration')
 
         module = globals()[m]
-        n_ = int(round(n * depth_mult)) if n > 1 else n
+        n_ = int(round(n * depth)) if n > 1 else n
 
         # resolve any string args like '(1,2,2)'
         resolved_args = []
@@ -54,13 +53,6 @@ def parse_model(d: dict, ch: int, scale: str = 's', verbose: bool = False, heigh
                 raise ValueError('MS_GetT is only allowed at the first layer (i == 0).')
             mod_args = [c1, c2, *args[1:]]
             c_out = c1
-        elif module is MS_GetT_Voxel:
-            c1 = ch_list[f]
-            c2 = args[0]
-            if i != 0:
-                raise ValueError('MS_GetT_Voxel is only allowed at the first layer (i == 0).')
-            mod_args = [c1, c2, *args[1:], height, width]
-            c_out = c1
         elif module is MS_CancelT:
             c1 = ch_list[f]
             c2 = args[0]
@@ -68,7 +60,7 @@ def parse_model(d: dict, ch: int, scale: str = 's', verbose: bool = False, heigh
             c_out = c1
         elif module is MS_DownSampling:
             c1 = ch_list[f]
-            c2 = _make_divisible(min(int(args[0] * width_mult), int(max_channels)))
+            c2 = _make_divisible(min(int(args[0] * width), int(max_channels)))
             mod_args = [c1, c2, *args[1:]]
             c_out = c2
         elif module in (MS_ConvBlock, MS_AllConvBlock):
@@ -78,7 +70,7 @@ def parse_model(d: dict, ch: int, scale: str = 's', verbose: bool = False, heigh
             c_out = c1
         elif module is MS_StandardConv:
             c1 = ch_list[f]
-            c2 = _make_divisible(min(int(args[0] * width_mult), int(max_channels)))
+            c2 = _make_divisible(min(int(args[0] * width), int(max_channels)))
             mod_args = [c1, c2, *args[1:]]
             c_out = c2
         elif module is SpikeSPPF:
@@ -105,15 +97,14 @@ def parse_model(d: dict, ch: int, scale: str = 's', verbose: bool = False, heigh
 
 
 class YAMLBackbone(nn.Module):
-    def __init__(self, yaml_path: str, scale: str = 's', in_ch: int = 2, height: int = None, width: int = None, temporal_bins: Optional[int] = None):
+    def __init__(self, yaml_path: str, scale: str = 's', in_ch: int = 2):
         super().__init__()
         with open(yaml_path, 'r') as f:
             d = yaml.safe_load(f)
-        self.model, self.save, self.tap_indices = parse_model(d, ch=in_ch, scale=scale, verbose=False, height=height, width=width)
-        if temporal_bins is not None and isinstance(self.model[0], MS_GetT_Voxel):
-            self.model[0].T = int(temporal_bins)
+        self.model, self.save, self.tap_indices = parse_model(d, ch=in_ch, scale=scale, verbose=False)
 
     def forward(self, x4d: torch.Tensor):
+        # x4d: [B, C=2, H, W]
         y = []
         x = x4d
         taps = {}

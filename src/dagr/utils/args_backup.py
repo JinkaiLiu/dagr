@@ -53,7 +53,6 @@ def BASE_FLAGS():
     parser.add_argument("--use_snn_backbone", action="store_true", help="Enable SNN backbone defined by a YAML config")
     parser.add_argument("--snn_yaml_path", default=argparse.SUPPRESS, type=str, help="Path to SNN YAML config file")
     parser.add_argument("--snn_scale", default=argparse.SUPPRESS, type=str, help="Model scale for SNN backbone (e.g., s/m/l)")
-    parser.add_argument("--snn_temporal_bins", type=int, default=4, help="Temporal bins T for SNN voxelization (default: 4)")
 
     return parser
 

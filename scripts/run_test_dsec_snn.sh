@@ -18,6 +18,7 @@ EXP_NAME=snn_yaml_s_fulltre16
 # SNN backbone config 
 SNN_YAML=src/dagr/cfg/snn_yolov8.yaml
 SNN_SCALE=s
+SNN_TEMPORAL_BINS=4
 
 # Hyperparameters
 BATCH_SIZE=64
@@ -47,6 +48,7 @@ $PYTHON "$TEST_SCRIPT" \
   --use_snn_backbone \
   --snn_yaml_path "$SNN_YAML" \
   --snn_scale "$SNN_SCALE" \
+  --snn_temporal_bins "$SNN_TEMPORAL_BINS" \
   --dataset_directory "$DATASET_DIR" \
   --checkpoint "$CHECKPOINT" \
   2>&1 | tee "$LOG_FILE"
