@@ -60,4 +60,7 @@ if __name__ == '__main__':
         metrics = run_test_with_visualization(test_loader, ema.ema, dataset=args.dataset)
         log_data = {f"testing/metric/{k}": v for k, v in metrics.items()}
         wandb.log(log_data)
-        print(metrics['mAP'])
+
+        main_metrics = ["mAP", "mAP_50", "mAP_75", "mAP_S", "mAP_M", "mAP_L"]
+        formatted_metrics = ", ".join([f"{k}={metrics[k]:.4f}" for k in main_metrics if k in metrics])
+        print(formatted_metrics)
