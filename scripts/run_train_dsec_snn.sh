@@ -16,7 +16,7 @@ TRAIN_SCRIPT=scripts/train_dsec_snn.py
 
 # Output
 OUTPUT_DIR=/media/data/hucao/jinkai/dagr/logs_snn
-EXP_NAME=snn_yaml_s_fulltre16
+EXP_NAME=event_only_4_timeslices
 
 # SNN backbone config
 SNN_YAML=src/dagr/cfg/snn_yolov8.yaml

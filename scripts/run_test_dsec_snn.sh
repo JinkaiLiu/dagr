@@ -13,7 +13,7 @@ TEST_SCRIPT=scripts/test_dsec_snn.py
 
 # Output
 OUTPUT_DIR=/media/data/hucao/jinkai/dagr/logs_snn
-EXP_NAME=snn_yaml_s_fulltre16
+EXP_NAME=event_only_4_timeslices
 
 # SNN backbone config 
 SNN_YAML=src/dagr/cfg/snn_yolov8.yaml
@@ -30,7 +30,7 @@ DATASET=DSEC_Det
 DATASET_DIR=/media/data/hucao/zhenwu/hucao/DSEC
 
 # Checkpoint path
-CHECKPOINT="${OUTPUT_DIR}/DSEC_Det/detection/hmtxq7dk/last_model.pth" 
+CHECKPOINT="${OUTPUT_DIR}/DSEC_Det/detection/event_only_4_timeslices/last_model.pth" 
 
 # Create log file with timestamp
 LOG_FILE="${OUTPUT_DIR}/${EXP_NAME}_test_$(date +%Y%m%d_%H%M%S).log"
