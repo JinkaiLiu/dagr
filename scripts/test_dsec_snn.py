@@ -37,9 +37,9 @@ if __name__ == '__main__':
     log_hparams(args)
     
     print("init datasets")
-    dataset_path = args.dataset_directory.parent / args.dataset
-    
-    test_dataset = DSEC(args.dataset_directory, "test", Augmentations.transform_testing, debug=False, min_bbox_diag=15, min_bbox_height=10)
+
+    dataset_path = args.dataset_directory / args.dataset
+    test_dataset = DSEC(root=dataset_path, split="test", transform=Augmentations.transform_testing, debug=False, min_bbox_diag=15, min_bbox_height=10)
     
     num_iters_per_epoch = 1
     
