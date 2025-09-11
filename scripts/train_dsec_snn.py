@@ -245,7 +245,7 @@ if __name__ == '__main__':
 
     print("starting to train")
     for epoch in range(start_epoch, args.tot_num_epochs):
-        mean_loss = train(train_loader, model, ema, lr_scheduler, optimizer, args, run_name=wandb.run.name)
+        mean_loss = train(train_loader, model, ema, lr_scheduler, optimizer, args, run_name=args.exp_name)
         try:
             current_lr = lr_scheduler.get_last_lr()[-1]
         except Exception:
